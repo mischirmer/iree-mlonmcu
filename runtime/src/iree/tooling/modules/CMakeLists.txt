@@ -121,6 +121,7 @@ endif()
 
 set(_RESOLVER_INTERNAL_DEPS)
 list(APPEND _RESOLVER_INTERNAL_DEPS iree::modules::vmvx)
+list(APPEND _RESOLVER_INTERNAL_DEPS iree::modules::abft_analysis)
 
 iree_cc_library(
   NAME

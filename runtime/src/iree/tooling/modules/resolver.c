@@ -10,6 +10,8 @@
 #include "iree/modules/vmvx/module.h"
 #endif  // IREE_HAVE_VMVX_MODULE
 
+#include "iree/modules/abft_analysis/module.h"
+
 #if defined(IREE_HAVE_EXTERNAL_TOOLING_MODULES)
 // Defined in the generated registry_external.c file:
 extern iree_status_t iree_tooling_register_external_module_types(
@@ -51,6 +53,10 @@ iree_status_t iree_tooling_resolve_module_dependency(
     // VMVX module used on the host side for the inline HAL.
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
         z0, iree_vmvx_module_create(instance, host_allocator, &module));
+  } else if (iree_string_view_equal(dependency->name,
+                                    IREE_SV("abft_analysis"))) {
+    IREE_RETURN_AND_END_ZONE_IF_ERROR(
+        z0, iree_abft_analysis_module_create(instance, host_allocator, &module));
   } else {
     // Try to resolve the module from externally-defined modules.
     // If the module is not found this will succeed but module will be NULL.

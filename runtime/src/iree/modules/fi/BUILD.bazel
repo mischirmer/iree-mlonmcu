@@ -1,0 +1,11 @@
+load("//build_tools/bazel:build_defs.oss.bzl", "iree_runtime_cc_library")
+
+iree_runtime_cc_library(
+    name = "fi",
+    srcs = ["module.c"],
+    hdrs = ["module.h"],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/vm",
+    ],
+)

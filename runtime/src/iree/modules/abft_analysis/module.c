@@ -16,6 +16,7 @@
 
 #define IREE_ABFT_ANALYSIS_MODULE_VERSION_0_0 0x00000000u
 #define IREE_ABFT_ANALYSIS_MODULE_VERSION_LATEST IREE_ABFT_ANALYSIS_MODULE_VERSION_0_0
+#define IREE_ABFT_ANALYSIS_DELTA_ASSERT_THRESHOLD 1.0e3f
 
 // Define shims for (f) -> (), (ff) -> (), (fff) -> (), and () -> (I) signatures.
 IREE_VM_ABI_FIXED_STRUCT(ff, {
@@ -71,6 +72,8 @@ typedef struct iree_abft_analysis_module_state_t {
   iree_allocator_t host_allocator;
   int64_t failure_count;
   int report_enabled;
+  int delta_assert_enabled;
+  float delta_assert_threshold;
   const char* log_path;
 } iree_abft_analysis_module_state_t;
 
@@ -88,11 +91,27 @@ static iree_status_t IREE_API_PTR iree_abft_analysis_module_alloc_state(
   memset(state, 0, sizeof(*state));
   state->host_allocator = host_allocator;
   state->failure_count = 0;
+  // Make failure reporting opt-in so instrumentation for profiling/runtime
+  // comparisons does not force MLONMCU EXIT: 1 in clean runs.
+  // Set IREE_ABFT_REPORT=1 to enable strict failure counting/reporting.
   const char* report_env = getenv("IREE_ABFT_REPORT");
-  if (report_env && report_env[0] == '0' && report_env[1] == '\0') {
-    state->report_enabled = 0;
-  } else {
+  if (report_env && report_env[0] == '1' && report_env[1] == '\0') {
     state->report_enabled = 1;
+  } else {
+    state->report_enabled = 0;
+  }
+  // Optional hard assertion on logged row/col deltas.
+  // Disabled by default to avoid aborting normal runs.
+  state->delta_assert_enabled = 0;
+  state->delta_assert_threshold = IREE_ABFT_ANALYSIS_DELTA_ASSERT_THRESHOLD;
+  const char* assert_env = getenv("IREE_ABFT_DELTA_ASSERT");
+  if (assert_env && assert_env[0] != '\0' && assert_env[0] != '0') {
+    state->delta_assert_enabled = 1;
+  }
+  const char* assert_thr_env = getenv("IREE_ABFT_DELTA_ASSERT_THRESHOLD");
+  if (assert_thr_env && assert_thr_env[0] != '\0') {
+    float parsed = strtof(assert_thr_env, NULL);
+    if (parsed > 0.0f) state->delta_assert_threshold = parsed;
   }
   const char* log_env = getenv("IREE_ABFT_LOG_PATH");
   if (log_env && log_env[0] != '\0') {
@@ -186,11 +205,23 @@ IREE_VM_ABI_EXPORT(iree_abft_analysis_module_abft_report_failure,
 // Logs per-layer full-checksum max absolute deltas.
 IREE_VM_ABI_EXPORT(iree_abft_analysis_module_abft_log_rowcol_delta,
                    iree_abft_analysis_module_state_t, fff, v) {
+  const float row_delta = args->f1;
+  const float col_delta = args->f2;
+  if (state->delta_assert_enabled &&
+      (fabsf(row_delta) > state->delta_assert_threshold ||
+       fabsf(col_delta) > state->delta_assert_threshold)) {
+    return iree_make_status(
+        IREE_STATUS_FAILED_PRECONDITION,
+        "ABFT/Freivalds delta assertion failed: layer=%g rowMaxDelta=%g "
+        "colMaxDelta=%g (limit=%g)",
+        args->f0, row_delta, col_delta,
+        state->delta_assert_threshold);
+  }
   if (!state->log_path) return iree_ok_status();
   FILE* f = fopen(state->log_path, "a");
   if (!f) return iree_ok_status();
     fprintf(f, "layer=%.15g rowMaxDelta=%.15g colMaxDelta=%.15g\n", args->f0,
-            args->f1, args->f2);
+            row_delta, col_delta);
   fclose(f);
   return iree_ok_status();
 }
@@ -198,13 +229,25 @@ IREE_VM_ABI_EXPORT(iree_abft_analysis_module_abft_log_rowcol_delta,
 // Logs per-layer full-checksum absolute and relative metrics.
 IREE_VM_ABI_EXPORT(iree_abft_analysis_module_abft_log_rowcol_metrics,
                    iree_abft_analysis_module_state_t, fffff, v) {
+  const float row_delta = args->f1;
+  const float col_delta = args->f2;
+  if (state->delta_assert_enabled &&
+      (fabsf(row_delta) > state->delta_assert_threshold ||
+       fabsf(col_delta) > state->delta_assert_threshold)) {
+    return iree_make_status(
+        IREE_STATUS_FAILED_PRECONDITION,
+        "ABFT/Freivalds delta assertion failed: layer=%g rowMaxDelta=%g "
+        "colMaxDelta=%g (limit=%g)",
+        args->f0, row_delta, col_delta,
+        state->delta_assert_threshold);
+  }
   if (!state->log_path) return iree_ok_status();
   FILE* f = fopen(state->log_path, "a");
   if (!f) return iree_ok_status();
     fprintf(
       f,
       "layer=%.15g rowMaxDelta=%.15g colMaxDelta=%.15g rowMaxRel=%.15g colMaxRel=%.15g\n",
-      args->f0, args->f1, args->f2, args->f3, args->f4);
+      args->f0, row_delta, col_delta, args->f3, args->f4);
   fclose(f);
   return iree_ok_status();
 }

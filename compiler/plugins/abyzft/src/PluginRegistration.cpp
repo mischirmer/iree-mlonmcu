@@ -6,7 +6,6 @@
 
 // Factory from AByzFTPass.cpp
 std::unique_ptr<mlir::Pass> createAByzFTPass();
-std::unique_ptr<mlir::Pass> createFreivaldPass();
 
 namespace mlir::iree_compiler::plugins::abyzft {
 
@@ -17,22 +16,9 @@ struct AByzFTPassSession
   }
 };
 
-struct FreivaldPassSession
-    : public mlir::iree_compiler::PluginSession<FreivaldPassSession> {
-  void extendPreprocessingPassPipeline(OpPassManager &pm) override {
-    pm.addPass(createFreivaldPass());
-  }
-};
-
 extern "C" bool iree_register_compiler_plugin_abyzft_pass(
     mlir::iree_compiler::PluginRegistrar *registrar) {
   registrar->registerPlugin<AByzFTPassSession>("abyzft_pass");
-  return true;
-}
-
-extern "C" bool iree_register_compiler_plugin_freivald_pass(
-    mlir::iree_compiler::PluginRegistrar *registrar) {
-  registrar->registerPlugin<FreivaldPassSession>("freivald_pass");
   return true;
 }
 
@@ -47,11 +33,6 @@ extern "C" bool __attribute__((weak)) iree_register_compiler_plugin_abyzft(
     mlir::iree_compiler::PluginRegistrar *registrar) {
   // Forward to the canonical registration function.
   return iree_register_compiler_plugin_abyzft_pass(registrar);
-}
-
-extern "C" bool __attribute__((weak)) iree_register_compiler_plugin_freivald(
-    mlir::iree_compiler::PluginRegistrar *registrar) {
-  return iree_register_compiler_plugin_freivald_pass(registrar);
 }
 
 }  // namespace mlir::iree_compiler::plugins::abyzft

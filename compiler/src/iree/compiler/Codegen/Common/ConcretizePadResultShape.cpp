@@ -6,7 +6,7 @@
 
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Common/Transforms.h"
-#include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
+#include "iree/compiler/Dialect/TensorExt/IR/TensorExtOps.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -37,7 +37,7 @@ static Value getAsIndexValue(OpFoldResult attrOrValue, OpBuilder &builder,
       return val;
     matchPattern(val, m_Constant(&attr));
   } else {
-    attr = llvm::cast<IntegerAttr>(attrOrValue.get<Attribute>());
+    attr = llvm::cast<IntegerAttr>(cast<Attribute>(attrOrValue));
   }
   return builder.createOrFold<arith::ConstantIndexOp>(
       loc, attr.getValue().getSExtValue());
@@ -166,10 +166,10 @@ void populateConcretizePadResultShapePatterns(RewritePatternSet &patterns,
   // Pulling in upstream scf.for and affine.min canonicalization patterns.
   // They work on tiled (but not distributed) loops.
   scf::populateSCFForLoopCanonicalizationPatterns(patterns);
-  // Pulling in flow.dispatch.tensor.load op canonicalization patterns.
-  // Tiling can generate dim ops taking them as operands.
-  IREE::Flow::DispatchTensorLoadOp::getCanonicalizationPatterns(patterns,
-                                                                context);
+  // Pulling in iree_tensor_ext.dispatch.tensor.load op canonicalization
+  // patterns. Tiling can generate dim ops taking them as operands.
+  IREE::TensorExt::DispatchTensorLoadOp::getCanonicalizationPatterns(patterns,
+                                                                     context);
   // Pull in tensor dialect canonicalization patterns to fold tensor.cast
   // into producers when possible.
   context->getLoadedDialect<tensor::TensorDialect>()

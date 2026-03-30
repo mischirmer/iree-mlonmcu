@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Codegen/Common/Passes.h"
+#include "iree/compiler/Codegen/Transforms/Transforms.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/Transforms/Hoisting.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -12,6 +13,7 @@
 #include "mlir/Dialect/Tensor/Utils/Utils.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Transforms/VectorTransforms.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/Interfaces/SubsetOpInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -221,6 +223,23 @@ void hoistSubsetWithLoopInvariantTensor(RewriterBase &rewriter,
   }
 }
 
+void moveLoopInvariantCodeFromGenericOps(Operation *op) {
+  // linalg.generic operations are also loop-like, but they don't have
+  // LoopLikeOpInterface implemented for them.
+  op->walk([&](linalg::GenericOp genericOp) {
+    moveLoopInvariantCode(
+        &genericOp.getBodyRegion(),
+        [&](Value value, Region *) {
+          return !genericOp->isAncestor(value.getParentRegion()->getParentOp());
+        },
+        [&](Operation *op, Region *) {
+          return !isa<linalg::IndexOp>(op) && isMemoryEffectFree(op) &&
+                 isSpeculatable(op);
+        },
+        [&](Operation *op, Region *) { op->moveBefore(genericOp); });
+  });
+}
+
 namespace {
 struct CastLikeExtractSliceOpFolder final
     : OpRewritePattern<tensor::ExtractSliceOp> {
@@ -253,12 +272,44 @@ struct CastLikeInsertSliceOpFolder final
 };
 } // namespace
 
+// Find the earliest insertion point in the block for the given operation.
+static Operation *getEarliestInsertionPointInsideBlock(Block *block,
+                                                       Operation *op) {
+
+  Operation *currInsertionPoint = &(*block->getOperations().begin());
+  DominanceInfo dominanceInfo(currInsertionPoint);
+
+  for (auto operand : op->getOperands()) {
+    if (auto blockArg = dyn_cast<BlockArgument>(operand)) {
+      continue;
+    }
+    Operation *defOp = operand.getDefiningOp();
+    if (!dominanceInfo.dominates(defOp, currInsertionPoint)) {
+      currInsertionPoint = defOp;
+    }
+  }
+  return currInsertionPoint;
+}
+
 void OptimizeTensorInsertExtractSlicesPass::runOnOperation() {
   auto funcOp = getOperation();
   IRRewriter rewriter(funcOp->getContext());
 
+  // TODO: This is a temporary hack enabled for bufferization to
+  // get rid of empty buffers.
+  // Tracked here: https://github.com/llvm/llvm-project/issues/122869
+  funcOp.walk([&](tensor::ExtractSliceOp extractSliceOp) {
+    Block *currBlock = extractSliceOp.getOperation()->getBlock();
+    auto latestInsertionPoint =
+        getEarliestInsertionPointInsideBlock(currBlock, extractSliceOp);
+    extractSliceOp->moveAfter(latestInsertionPoint);
+  });
+
   funcOp.walk([&](scf::ForOp forOp) { moveLoopInvariantCode(forOp); });
   LDBG("after hoisting loop invariant code\n" << funcOp);
+
+  moveLoopInvariantCodeFromGenericOps(funcOp);
+  LDBG("after hoisting loop invariant code out of generic ops\n" << funcOp);
 
   // TODO: walking in some reverse / inside-out order would be more efficient
   // and would capture more cases.

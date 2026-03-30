@@ -133,111 +133,105 @@ static bool isSmallerThan(ArrayRef<int64_t> sourceShape,
                       });
 }
 
-//===----------------------------------------------------------------------===//
-// ScatterOp
-//===----------------------------------------------------------------------===//
-
-LogicalResult ScatterOp::verify() {
-  Operation *op = getOperation();
-  if (getInputs().size() != 2) {
-    return op->emitOpError("expected two input operands");
+/// Helper function to verify both `scatter` and `gather`. Since both ops share
+/// the same sementics, we can use the same function to verify them. Note: this
+/// is written from the perspective of `scatter` op. For gather, `updateType`
+/// maps to the type of the output and `originalType` maps to the type of the
+/// `source`.
+template <typename OpTy>
+static LogicalResult
+verifyGatherScatter(OpTy op, int64_t sliceRank, ShapedType originalType,
+                    ShapedType updateType, StringRef originalName,
+                    StringRef updateName) {
+  static_assert(llvm::is_one_of<OpTy, GatherOp, ScatterOp>::value,
+                "applies to only gather or scatter operations");
+  if (op.getInputs().size() != 2) {
+    return op.emitOpError("expected two input operands");
   }
-  if (getOutputs().size() != 1) {
-    return op->emitOpError("expected one output operand");
+  if (op.getOutputs().size() != 1) {
+    return op.emitOpError("expected one output operand");
   }
 
-  auto indicesType = getIndicesType();
-  if (indicesType.getRank() < 2 ||
+  auto indicesType = op.getIndicesType();
+  if (indicesType.getRank() < 1 ||
       !isa<IntegerType>(indicesType.getElementType())) {
-    return op->emitOpError("expected indices to be of rank 2 or greater and of "
+    return op->emitOpError("expected indices to be of rank 1 or greater and of "
                            "integer element type");
   }
-  auto indexDepth = getIndexDepth();
-  if (ShapedType::isDynamic(indexDepth)) {
-    return op->emitOpError("expected index depth is static");
-  }
 
-  ArrayRef<int64_t> dimMap = getDimensionMap();
-  if (dimMap.size() != indexDepth) {
-    return op->emitOpError("invalid number of dimension map entries");
-  }
-
-  auto originalType = getOriginalType();
+  ArrayRef<int64_t> dimMap = op.getDimensionMap();
   if (failed(isPermSequence(
-          [&]() { return this->emitOpError("dimension map is invalid."); },
+          [&]() { return op->emitOpError("dimension map is invalid."); },
           dimMap))) {
     return failure();
   }
 
-  if (indexDepth > originalType.getShape().size()) {
+  if (dimMap.size() == 0) {
+    return op->emitOpError("dimension map must have at least one element");
+  }
+
+  const size_t indexDepth = op.getIndexDepth();
+  const auto originalSliceRank = originalType.getRank() - indexDepth;
+  if (originalSliceRank < 0) {
+    return op->emitOpError("expected " + originalName +
+                           " rank to be greater or equal to index depth");
+  }
+  if (updateType.getRank() < originalSliceRank) {
+    return op->emitOpError("expected " + updateName +
+                           " to be at least the rank of non indexed " +
+                           originalName + " dims");
+  }
+  const size_t batchRank = updateType.getRank() - originalSliceRank;
+
+  if (updateType.getRank() - batchRank != originalSliceRank) {
+    return op->emitOpError("expected rank of " + updateName +
+                           " value - batch rank to be "
+                           "equal to rank of " +
+                           originalName + " value - index depth");
+  }
+
+  if ((indicesType.getRank() != batchRank || indexDepth != 1) &&
+      indicesType.getRank() != batchRank + 1) {
+    return op->emitOpError("expected indices to be equal to batch rank "
+                           "or batch rank + 1");
+  }
+
+  {
+    // Validate the shape of indices and update value match for the first
+    // `batchRank` dims.
+    auto [indicesIt, updateIt] =
+        llvm::mismatch(indicesType.getShape().take_front(batchRank),
+                       updateType.getShape().take_front(batchRank));
+    if (indicesIt != indicesType.getShape().take_front(batchRank).end()) {
+      return op->emitOpError("mismatch in shape of indices and " + updateName +
+                             " value at dim#")
+             << (indicesIt - indicesType.getShape().begin());
+    }
+  }
+  if (batchRank + 1 < indicesType.getShape().size() &&
+      dimMap.size() != indicesType.getShape().back()) {
     return op->emitOpError(
-        "index depth is greater than the rank of the original value");
+        "size of dimension map must match the last dimension of indices");
   }
 
-  auto updateType = getUpdateType();
-  auto batchRank = indicesType.getRank() - 1;
-  if (updateType.getRank() < batchRank) {
-    return op->emitOpError("expected update value to be of rank greater than "
-                           "or equal to rank(indices) - 1")
-           << batchRank;
-  }
-
-  // Validate the shape of indices and update value match for the first
-  // `batchRank` dims.
-  auto [indicesIt, updateIt] =
-      llvm::mismatch(indicesType.getShape().take_front(batchRank),
-                     updateType.getShape().take_front(batchRank));
-  if (indicesIt != indicesType.getShape().take_front(batchRank).end()) {
-    return op->emitOpError(
-               "mismatch in shape of indices and update value at dim#")
-           << (indicesIt - indicesType.getShape().begin());
-  }
-
-  if (updateType.getRank() - batchRank > originalType.getRank()) {
-    return op->emitOpError("update operand's slice rank (")
-           << updateType.getRank() - batchRank
-           << " = rank(updates) - batch rank) exceeds the rank of the original "
-              "value ("
-           << originalType.getRank() << ")";
-  }
-
-  // TODO: make it illegal for `numImplicitDims` to be non-zero.
-  auto numImplicitDims = originalType.getRank() - getUpdateSliceRank();
-  if (numImplicitDims > indexDepth) {
-    return op->emitOpError(
-        "update and index depth does not fully index original");
-  }
-
-  // updateSlice[0..indexDepth] <= original[0..indexDepth]
-  // updateSlice[indexDepth..] == original[indexDepth..]
-  auto updateSliceShape = getUpdateSliceShape();
-  for (uint64_t fullSliceIdx :
-       llvm::seq<uint64_t>(numImplicitDims, indexDepth)) {
-    int64_t originalDim = fullSliceIdx;
-    int64_t updateSliceDim = fullSliceIdx - numImplicitDims;
-    if (!originalType.isDynamicDim(originalDim) &&
-        updateSliceShape[updateSliceDim] >
-            originalType.getDimSize(originalDim)) {
-      return op->emitOpError("shape of update value dim#")
-             << updateSliceDim + batchRank << " exceeds original value at dim#"
-             << originalDim;
+  {
+    for (auto idx : llvm::seq<int64_t>(0, sliceRank)) {
+      int64_t updateDim = idx + batchRank;
+      int64_t origDim = idx + indexDepth;
+      if (originalType.isDynamicDim(origDim) ||
+          updateType.isDynamicDim(updateDim)) {
+        continue;
+      }
+      if (originalType.getDimSize(origDim) !=
+          updateType.getDimSize(updateDim)) {
+        return op->emitOpError("shape of " + updateName + " value dim#")
+               << (updateDim)
+               << " must match " + originalName + " value at dim#" << (origDim);
+      }
     }
   }
 
-  for (auto fullSliceIdx :
-       llvm::seq<int64_t>(indexDepth, originalType.getRank())) {
-    int64_t originalDim = fullSliceIdx;
-    int64_t updateSliceDim = fullSliceIdx - numImplicitDims;
-    if (!originalType.isDynamicDim(originalDim) &&
-        updateSliceShape[updateSliceDim] !=
-            originalType.getDimSize(originalDim)) {
-      return op->emitOpError("shape of update value dim#")
-             << updateSliceDim + batchRank
-             << " must match original value at dim#" << originalDim;
-    }
-  }
-
-  Region &region = this->getRegion();
+  Region &region = op.getRegion();
   Block *body = &region.front();
   if (body->getNumArguments() != 2) {
     return op->emitOpError("expected region to have two arguments");
@@ -251,12 +245,12 @@ LogicalResult ScatterOp::verify() {
   }
   if (arg0Type != updateType.getElementType()) {
     return op->emitOpError("mismatch in argument 0 of region ")
-           << arg0Type << " and element type of update value "
+           << arg0Type << " and element type of " + updateName + " value "
            << updateType.getElementType();
   }
   if (arg1Type != originalType.getElementType()) {
     return op->emitOpError("mismatch in argument 1 of region ")
-           << arg1Type << " and element type of original value "
+           << arg1Type << " and element type of " + originalName + " value "
            << originalType.getElementType();
   }
   if (arg0Type != arg1Type) {
@@ -273,6 +267,15 @@ LogicalResult ScatterOp::verify() {
            << yieldedType << " and argument of the region " << arg0Type;
   }
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// ScatterOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult ScatterOp::verify() {
+  return verifyGatherScatter(*this, getUpdateSliceRank(), getOriginalType(),
+                             getUpdateType(), "original", "update");
 }
 
 LogicalResult
@@ -296,6 +299,22 @@ SmallVector<AffineMap> ScatterOp::getIndexingMapsForOperands() {
 
 SmallVector<AffineMap> ScatterOp::getIndexingMapsForResults() {
   return {AffineMap(nullptr)};
+}
+
+//===----------------------------------------------------------------------===//
+// GatherOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult GatherOp::verify() {
+  return verifyGatherScatter(*this, getOutputSliceRank(), getSourceType(),
+                             getOutputType(), "source", "output");
+}
+
+LogicalResult
+GatherOp::reifyResultShapes(OpBuilder &b,
+                            ReifiedRankedShapedTypeDims &reifiedReturnShapes) {
+  return cast<LinalgExtOp>(getOperation())
+      .reifyResultShapes(b, reifiedReturnShapes);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1627,13 +1646,16 @@ SmallVector<int64_t> Im2colOp::getKOutputDims() {
 }
 
 /// Custom builder methods for im2col op.
-void Im2colOp::build(
-    OpBuilder &builder, OperationState &state, Value input, Value output,
-    ArrayRef<int64_t> strides, ArrayRef<int64_t> dilations,
-    ArrayRef<OpFoldResult> kernelSize, ArrayRef<OpFoldResult> mOffset,
-    ArrayRef<OpFoldResult> mStrides, ArrayRef<OpFoldResult> kOffset,
-    ArrayRef<OpFoldResult> kStrides, ArrayRef<int64_t> batchPos,
-    ArrayRef<int64_t> mPos, ArrayRef<int64_t> kPos) {
+void Im2colOp::build(OpBuilder &builder, OperationState &state, Value input,
+                     Value output, ArrayRef<int64_t> strides,
+                     ArrayRef<int64_t> dilations,
+                     ArrayRef<OpFoldResult> kernelSize,
+                     ArrayRef<OpFoldResult> mOffset,
+                     ArrayRef<OpFoldResult> mStrides,
+                     ArrayRef<OpFoldResult> kOffset,
+                     ArrayRef<OpFoldResult> kStrides,
+                     ArrayRef<int64_t> batchPos, ArrayRef<int64_t> mPos,
+                     ArrayRef<int64_t> kPos, ArrayRef<int64_t> inputKPerm) {
   assert(strides.size() == kernelSize.size() &&
          dilations.size() == kernelSize.size() &&
          mPos.size() == kernelSize.size() &&
@@ -1661,7 +1683,8 @@ void Im2colOp::build(
         builder.getDenseI64ArrayAttr(staticKOffset), dynamicKStrides,
         builder.getDenseI64ArrayAttr(staticKStrides),
         builder.getDenseI64ArrayAttr(batchPos),
-        builder.getDenseI64ArrayAttr(mPos), builder.getDenseI64ArrayAttr(kPos));
+        builder.getDenseI64ArrayAttr(mPos), builder.getDenseI64ArrayAttr(kPos),
+        builder.getDenseI64ArrayAttr(inputKPerm));
 }
 
 LogicalResult Im2colOp::verify() {
@@ -1724,6 +1747,7 @@ LogicalResult Im2colOp::verify() {
   ArrayRef<int64_t> strides = getStrides();
   ArrayRef<int64_t> dilations = getDilations();
   SmallVector<OpFoldResult> kernelSize = getMixedKernelSize();
+  ArrayRef<int64_t> inputKPerm = getInputKPerm();
   if (kernelSize.size() != mPos.size()) {
     return op->emitOpError(
         "expected kernel rank to be equal to the m_pos rank");
@@ -1735,6 +1759,23 @@ LogicalResult Im2colOp::verify() {
   if (dilations.size() != kernelSize.size()) {
     return op->emitOpError(
         "expected dilations rank to be equal to the kernel rank");
+  }
+
+  size_t sharedRank = mPos.size() + kPos.size();
+  if (inputKPerm.size() != sharedRank) {
+    return op->emitOpError("expected input_k_perm size (")
+           << inputKPerm.size()
+           << ") to match the number of shared dimensions (m_Pos + k_pos = "
+           << sharedRank << ")";
+  }
+  SmallVector<int64_t> permVec(inputKPerm.begin(), inputKPerm.end());
+  llvm::sort(permVec);
+  for (int64_t i = 0; i < static_cast<int64_t>(sharedRank); ++i) {
+    if (permVec[i] != i) {
+      return op->emitOpError(
+                 "expected input_k_perm to be a permutation of [0, ")
+             << sharedRank << ")";
+    }
   }
 
   // Verify input and output shapes.
@@ -1963,6 +2004,7 @@ LogicalResult IREE::LinalgExt::IndexOp::verify() {
   }
 
 DEFINE_OP_GET_EFFECTS(ScatterOp)
+DEFINE_OP_GET_EFFECTS(GatherOp)
 DEFINE_OP_GET_EFFECTS(SortOp)
 DEFINE_OP_GET_EFFECTS(FftOp)
 DEFINE_OP_GET_EFFECTS(ScanOp)

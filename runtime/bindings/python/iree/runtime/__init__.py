@@ -26,6 +26,8 @@ from ._binding import (
 from ._binding import (
     BufferCompatibility,
     BufferUsage,
+    ExternalTimepointType,
+    ExternalTimepointFlags,
     HalAllocator,
     HalBuffer,
     HalBufferView,
@@ -34,12 +36,14 @@ from ._binding import (
     HalDeviceLoopBridge,
     HalDriver,
     HalElementType,
+    HalExternalTimepoint,
     HalFence,
     HalSemaphore,
     MappedMemory,
     MemoryAccess,
     MemoryType,
     PyModuleInterface,
+    SemaphoreCompatibility,
     Shape,
     create_hal_module,
 )
@@ -55,6 +59,10 @@ from ._binding import (
     VmModule,
     VmRef,
 )
+
+# Debug imports
+from ._binding import HalModuleDebugSink
+from .typing import HalModuleBufferViewTraceCallback
 
 from .array_interop import *
 from .benchmark import *

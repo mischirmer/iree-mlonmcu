@@ -21,7 +21,6 @@
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/PatternMatch.h"
-#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -32,16 +31,16 @@ namespace mlir::iree_compiler::DispatchCreation {
 #include "iree/compiler/DispatchCreation/Passes.h.inc"
 
 using IREE::Encoding::EncodingAttr;
+using IREE::Encoding::MatmulKAttr;
 
 //===---------------------------------------------------------------------===//
 // Utility functions
 //===---------------------------------------------------------------------===//
 
-Value setEncoding(OpBuilder &builder, Location loc, Value source,
-                  EncodingAttr encodingAttr) {
-  auto sourceType = cast<RankedTensorType>(source.getType());
-  auto resultType = RankedTensorType::get(
-      sourceType.getShape(), sourceType.getElementType(), encodingAttr);
+static Value setEncoding(OpBuilder &builder, Location loc, Value source,
+                         Attribute encodingAttr) {
+  auto resultType =
+      cast<RankedTensorType>(source.getType()).cloneWithEncoding(encodingAttr);
   return builder.create<IREE::Encoding::SetEncodingOp>(loc, resultType, source);
 };
 
@@ -87,14 +86,14 @@ static bool hasMatmulLikeBody(linalg::LinalgOp linalgOp) {
   if (!yieldOp) {
     return false;
   }
-  auto addOp = yieldOp->getOperand(0).getDefiningOp();
+  Operation *addOp = yieldOp->getOperand(0).getDefiningOp();
   if (!addOp || !isa<arith::AddIOp, arith::AddFOp>(addOp)) {
     return false;
   }
-  auto addLhs = addOp->getOperand(0);
-  auto addRhs = addOp->getOperand(1);
-  auto addLhsOp = addLhs.getDefiningOp();
-  auto addRhsOp = addRhs.getDefiningOp();
+  Value addLhs = addOp->getOperand(0);
+  Value addRhs = addOp->getOperand(1);
+  Operation *addLhsOp = addLhs.getDefiningOp();
+  Operation *addRhsOp = addRhs.getDefiningOp();
   if (!(addLhsOp && addRhs == outBlockArg) &&
       !(addRhsOp && addLhs == outBlockArg)) {
     return false;
@@ -103,8 +102,8 @@ static bool hasMatmulLikeBody(linalg::LinalgOp linalgOp) {
   if (!isa<arith::MulFOp, arith::MulIOp>(mulOp)) {
     return false;
   }
-  auto mulLhs = mulOp->getOperand(0);
-  auto mulRhs = mulOp->getOperand(1);
+  Value mulLhs = mulOp->getOperand(0);
+  Value mulRhs = mulOp->getOperand(1);
   auto mulLhsOp = mulLhs.getDefiningOp<CastOpInterface>();
   auto mulRhsOp = mulRhs.getDefiningOp<CastOpInterface>();
   if (!isa<BlockArgument>(mulLhs) && !mulLhsOp && !isa<BlockArgument>(mulRhs) &&
@@ -153,23 +152,35 @@ static LogicalResult isSupportedContractionOp(PatternRewriter &rewriter,
   return success();
 }
 
+static bool hasWorkgroupCounts(Operation *op) {
+  auto parentDispatchOp = op->getParentOfType<IREE::Flow::DispatchRegionOp>();
+  return parentDispatchOp && !parentDispatchOp.getWorkgroupCount().empty();
+}
+
 namespace {
 
-class setContractionOpEncoding
+class SetContractionOpEncoding final
     : public OpInterfaceRewritePattern<linalg::LinalgOp> {
 public:
-  using OpInterfaceRewritePattern<linalg::LinalgOp>::OpInterfaceRewritePattern;
-  explicit setContractionOpEncoding(MLIRContext *ctx, int64_t factor)
-      : OpInterfaceRewritePattern<linalg::LinalgOp>(ctx), padFactor(factor) {}
+  using OpInterfaceRewritePattern::OpInterfaceRewritePattern;
+  explicit SetContractionOpEncoding(MLIRContext *ctx, EncodingOptions &option)
+      : OpInterfaceRewritePattern<linalg::LinalgOp>(ctx),
+        encodingOption(option) {}
 
   LogicalResult matchAndRewrite(linalg::LinalgOp linalgOp,
                                 PatternRewriter &rewriter) const override {
+
     if (!linalgOp.hasPureTensorSemantics()) {
       return failure();
     }
     if (getCompilationInfo(linalgOp)) {
       return rewriter.notifyMatchFailure(
           linalgOp, "the op has preset compilation strategy, skip SetEncoding");
+    }
+    if (hasWorkgroupCounts(linalgOp.getOperation())) {
+      return rewriter.notifyMatchFailure(
+          linalgOp, "the op is in a region with workgroup counts, skip "
+                    "SetEncoding");
     }
     if (failed(isSupportedContractionOp(rewriter, linalgOp))) {
       return failure();
@@ -202,28 +213,56 @@ public:
     }
     SmallVector<Type> elemTypes = {lhsElemType, rhsElemType, outElemType};
 
-    auto narrowDim = IREE::Encoding::getMatmulNarrowDim(linalgOp, padFactor);
+    // The `iteration_sizes` are the linalg op's static loop ranges. From the
+    // combination of `iteration_sizes` and `user_indexing_maps`, we can later
+    // derive information such as the iteration size of the M/N dimensions of a
+    // matmul-like operation for example.
+    FailureOr<SmallVector<int64_t, 4>> maybeIterationSizes =
+        linalgOp.getStaticLoopRanges();
+    if (failed(maybeIterationSizes)) {
+      return failure();
+    }
+    SmallVector<int64_t> iterationSizes =
+        std::move(maybeIterationSizes.value());
 
     Location loc = linalgOp.getLoc();
     SmallVector<AffineMap> maps = linalgOp.getIndexingMapsArray();
 
     auto opType = IREE::Encoding::EncodingOpType::matmul;
     auto setEncodingWrapper = [&](Value src, int64_t operandIndex) -> Value {
-      SmallVector<int64_t> roundDimsTo(3, padFactor);
-      if (narrowDim.isM()) {
-        roundDimsTo[0] = llvm::PowerOf2Ceil(narrowDim.size);
+      MLIRContext *ctx = linalgOp.getContext();
+      Attribute encoding;
+      switch (encodingOption) {
+      case EncodingOptions::Generic: {
+        encoding = EncodingAttr::get(ctx, operandIndex, opType, elemTypes, maps,
+                                     iterationSizes);
+        break;
       }
-      if (narrowDim.isN()) {
-        roundDimsTo[1] = llvm::PowerOf2Ceil(narrowDim.size);
+      case EncodingOptions::MatmulK: {
+        SmallVector<int32_t> kDims;
+        AffineMap indexingMap = maps[operandIndex];
+        auto cDims = linalg::inferContractionDims(linalgOp);
+        for (auto k : cDims->k) {
+          std::optional<unsigned> dimIdx =
+              indexingMap.getResultPosition(rewriter.getAffineDimExpr(k));
+          if (!dimIdx) {
+            continue;
+          }
+          kDims.push_back(dimIdx.value());
+        }
+        encoding = MatmulKAttr::get(ctx, kDims);
+        break;
       }
-      auto encoding = EncodingAttr::get(linalgOp.getContext(), operandIndex,
-                                        opType, elemTypes, maps,
-                                        /*bcastMap=*/std::nullopt, roundDimsTo);
+      default: {
+        assert(false && "Unsupported encoding option");
+        return Value();
+      }
+      }
       return setEncoding(rewriter, loc, src, encoding);
     };
-    Value encodedLhs = setEncodingWrapper(lhs, IREE::Encoding::MATMUL_LHS);
-    Value encodedRhs = setEncodingWrapper(rhs, IREE::Encoding::MATMUL_RHS);
-    Value encodedOut = setEncodingWrapper(out, IREE::Encoding::MATMUL_RESULT);
+    auto encodedLhs = setEncodingWrapper(lhs, IREE::Encoding::MATMUL_LHS);
+    auto encodedRhs = setEncodingWrapper(rhs, IREE::Encoding::MATMUL_RHS);
+    auto encodedOut = setEncodingWrapper(out, IREE::Encoding::MATMUL_RESULT);
     Value opTiled = clone(rewriter, linalgOp, encodedOut.getType(),
                           ValueRange{encodedLhs, encodedRhs, encodedOut})
                         ->getResult(0);
@@ -238,14 +277,14 @@ public:
   }
 
 private:
-  int64_t padFactor = 32;
+  EncodingOptions encodingOption;
 };
 
 /// Pattern to fold a `linalg.fill` -> `iree_encoding.set_encoding`
 /// operation into a `linalg.fill` of the encoded type.
 struct FoldFillWithSetEncoding final
-    : public OpRewritePattern<IREE::Encoding::SetEncodingOp> {
-  using OpRewritePattern<IREE::Encoding::SetEncodingOp>::OpRewritePattern;
+    : OpRewritePattern<IREE::Encoding::SetEncodingOp> {
+  using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(IREE::Encoding::SetEncodingOp encodingOp,
                                 PatternRewriter &rewriter) const override {
@@ -267,17 +306,19 @@ struct FoldFillWithSetEncoding final
   }
 };
 
-struct SetEncodingPass final
-    : public impl::SetEncodingPassBase<SetEncodingPass> {
+struct SetEncodingPass final : impl::SetEncodingPassBase<SetEncodingPass> {
   using Base::Base;
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
-    patterns.insert<setContractionOpEncoding>(context, padFactor);
+    patterns.add<SetContractionOpEncoding>(context, encodingOption.getValue());
     linalg::FillOp::getCanonicalizationPatterns(patterns, context);
-    patterns.insert<FoldFillWithSetEncoding>(context);
+    patterns.add<FoldFillWithSetEncoding>(context);
     memref::populateResolveRankedShapedTypeResultDimsPatterns(patterns);
-    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
+    GreedyRewriteConfig config;
+    config.cseConstants = false;
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns),
+                                     config))) {
       return signalPassFailure();
     }
   }

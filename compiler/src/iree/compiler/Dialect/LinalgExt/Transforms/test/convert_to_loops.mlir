@@ -356,42 +356,6 @@ func.func @scatter_update_slice_dynamic_2D(
 
 // -----
 
-func.func @scatter_partial_slices(%arg0: memref<2x64x12xf32>, %arg1: memref<2x3xi32>, %arg2: memref<2x1x12xf32>) {
-  iree_linalg_ext.scatter
-    dimension_map = [0, 1, 2]
-    unique_indices(true)
-    ins(%arg2, %arg1 : memref<2x1x12xf32>, memref<2x3xi32>)
-    outs(%arg0 : memref<2x64x12xf32>) {
-  ^bb0(%arg3: f32, %arg4: f32):
-    iree_linalg_ext.yield %arg4 : f32
-  }
-  return
-}
-
-// CHECK-LABEL: @scatter_partial_slices
-// CHECK-SAME:    %[[ARG0:[a-zA-Z0-9]+]]
-// CHECK-SAME:    %[[ARG1:[a-zA-Z0-9]+]]
-// CHECK-SAME:    %[[ARG2:[a-zA-Z0-9]+]]
-// CHECK-DAG: %[[C0:.+]] = arith.constant 0 : index
-// CHECK-DAG: %[[C1:.+]] = arith.constant 1 : index
-// CHECK-DAG: %[[C2:.+]] = arith.constant 2 : index
-// CHECK-DAG: %[[C12:.+]] = arith.constant 12 : index
-// CHECK:     scf.for %[[ARG3:.+]] = %[[C0]] to %[[C2]] step %[[C1]] {
-// CHECK-NEXT:   scf.for %[[ARG4:.+]] = %[[C0]] to %[[C1]] step %[[C1]] {
-// CHECK-NEXT:     scf.for %[[ARG5:.+]] = %[[C0]] to %[[C12]] step %[[C1]] {
-// CHECK-NEXT:       %[[LOAD0:.+]] = memref.load %[[ARG1]][%[[ARG3]], %[[C0]]] : memref<2x3xi32>
-// CHECK-NEXT:       %[[CAST0:.+]] = arith.index_cast %[[LOAD0]] : i32 to index
-// CHECK-NEXT:       %[[LOAD1:.+]] = memref.load %[[ARG1]][%[[ARG3]], %[[C1]]] : memref<2x3xi32>
-// CHECK-NEXT:       %[[CAST1:.+]] = arith.index_cast %[[LOAD1]] : i32 to index
-// CHECK-NEXT:       %[[ADD1:.+]] = arith.addi %[[CAST1]], %[[ARG4]] : index
-// CHECK-NEXT:       %[[LOAD2:.+]] = memref.load %[[ARG1]][%[[ARG3]], %[[C2]]] : memref<2x3xi32>
-// CHECK-NEXT:       %[[CAST2:.+]] = arith.index_cast %[[LOAD2]] : i32 to index
-// CHECK-NEXT:       %[[ADD2:.+]] = arith.addi %[[CAST2]], %[[ARG5]] : index
-// CHECK-NEXT:       %[[LOAD3:.+]] = memref.load %[[ARG0]][%[[CAST0]], %[[ADD1]], %[[ADD2]]] : memref<2x64x12xf32>
-// CHECK-NEXT:       memref.store %[[LOAD3]], %[[ARG0]][%[[CAST0]], %[[ADD1]], %[[ADD2]]] : memref<2x64x12xf32>
-
-// -----
-
 func.func @fft_1D(%real: memref<16xf32>, %imag: memref<16xf32>) {
   %stage = arith.constant 1 : index
   iree_linalg_ext.fft
@@ -1446,3 +1410,113 @@ func.func @unpack(%arg0: memref<1x4x6x6x2xf32>, %arg1: memref<1x6x6x8xf32>) {
 // CHECK:         }
 // CHECK:       }
 // CHECK:     }
+
+// -----
+
+func.func @gather_1d_indices(%arg0 : memref<10x10xi32>, %arg1 : memref<1xi32>, %arg2 : memref<1x10xi32>) {
+  iree_linalg_ext.gather
+    dimension_map = [0]
+    ins(%arg0, %arg1: memref<10x10xi32>, memref<1xi32>)
+    outs(%arg2: memref<1x10xi32>) {
+    ^bb0(%bb0: i32, %bb1: i32):
+      iree_linalg_ext.yield %bb0 : i32
+  }
+  return
+}
+// CHECK-LABEL: func @gather_1d_indices
+// CHECK-SAME:    %[[ARG0:[a-zA-Z0-9]+]]
+// CHECK-SAME:    %[[ARG1:[a-zA-Z0-9]+]]
+// CHECK-SAME:    %[[ARG2:[a-zA-Z0-9]+]]
+// CHECK-DAG:     %[[C0:.+]] = arith.constant 0 : index
+// CHECK-DAG:     %[[C1:.+]] = arith.constant 1 : index
+// CHECK-DAG:     %[[C10:.+]] = arith.constant 10 : index
+// CHECK:         scf.for %[[I:.+]] = %[[C0]] to %[[C1]] step %[[C1]] {
+// CHECK:           scf.for %[[J:.+]] = %[[C0]] to %[[C10]] step %[[C1]] {
+// CHECK:             %[[IDX:.+]] = memref.load %[[ARG1]][%[[I]]] : memref<1xi32>
+// CHECK:             %[[CAST:.+]] = arith.index_cast %[[IDX]] : i32 to index
+// CHECK:             %[[LOAD:.+]] = memref.load %[[ARG0]][%[[CAST]], %[[J]]] : memref<10x10xi32>
+
+// -----
+
+func.func @gather_2d_indices(%arg0 : memref<2x2xi32>, %arg1 : memref<2x2xi32>, %arg2 : memref<2xi32>) {
+  iree_linalg_ext.gather
+    dimension_map = [0, 1]
+    ins(%arg0, %arg1: memref<2x2xi32>, memref<2x2xi32>)
+    outs(%arg2: memref<2xi32>) {
+    ^bb0(%bb0: i32, %bb1: i32):
+      iree_linalg_ext.yield %bb0 : i32
+  }
+  return
+}
+// CHECK-LABEL: func @gather_2d_indices
+// CHECK-SAME:    %[[ARG0:[a-zA-Z0-9]+]]
+// CHECK-SAME:    %[[ARG1:[a-zA-Z0-9]+]]
+// CHECK-SAME:    %[[ARG2:[a-zA-Z0-9]+]]
+// CHECK-DAG:     %[[C0:.+]] = arith.constant 0 : index
+// CHECK-DAG:     %[[C2:.+]] = arith.constant 2 : index
+// CHECK-DAG:     %[[C1:.+]] = arith.constant 1 : index
+// CHECK:         scf.for %[[I:.+]] = %[[C0]] to %[[C2]] step %[[C1]] {
+// CHECK:           %[[IDX0:.+]] = memref.load %[[ARG1]][%[[I]], %[[C0]]] : memref<2x2xi32>
+// CHECK:           %[[CAST0:.+]] = arith.index_cast %[[IDX0]] : i32 to index
+// CHECK:           %[[IDX1:.+]] = memref.load %[[ARG1]][%[[I]], %[[C1]]] : memref<2x2xi32>
+// CHECK:           %[[CAST1:.+]] = arith.index_cast %[[IDX1]] : i32 to index
+// CHECK:           %[[LOAD0:.+]] = memref.load %[[ARG0]][%[[CAST0]], %[[CAST1]]] : memref<2x2xi32>
+// CHECK:           memref.store %[[LOAD0]], %[[ARG2]][%[[I]]] : memref<2xi32>
+
+// -----
+
+func.func @gather_perm_dim_map(%arg0 : memref<2x2xi32>, %arg1 : memref<2x2xi32>, %arg2 : memref<2xi32>) {
+  iree_linalg_ext.gather
+    dimension_map = [1, 0]
+    ins(%arg0, %arg1: memref<2x2xi32>, memref<2x2xi32>)
+    outs(%arg2: memref<2xi32>) {
+    ^bb0(%bb0: i32, %bb1: i32):
+      iree_linalg_ext.yield %bb0 : i32
+  }
+  return
+}
+// CHECK-LABEL: func @gather_perm_dim_map
+// CHECK-SAME:    %[[ARG0:[a-zA-Z0-9]+]]
+// CHECK-SAME:    %[[ARG1:[a-zA-Z0-9]+]]
+// CHECK-SAME:    %[[ARG2:[a-zA-Z0-9]+]]
+// CHECK-DAG:     %[[C0:.+]] = arith.constant 0 : index
+// CHECK-DAG:     %[[C2:.+]] = arith.constant 2 : index
+// CHECK-DAG:     %[[C1:.+]] = arith.constant 1 : index
+// CHECK:         scf.for %[[I:.+]] = %[[C0]] to %[[C2]] step %[[C1]] {
+// CHECK:           %[[IDX0:.+]] = memref.load %[[ARG1]][%[[I]], %[[C0]]] : memref<2x2xi32>
+// CHECK:           %[[CAST0:.+]] = arith.index_cast %[[IDX0]] : i32 to index
+// CHECK:           %[[IDX1:.+]] = memref.load %[[ARG1]][%[[I]], %[[C1]]] : memref<2x2xi32>
+// CHECK:           %[[CAST1:.+]] = arith.index_cast %[[IDX1]] : i32 to index
+// CHECK:           %[[LOAD0:.+]] = memref.load %[[ARG0]][%[[CAST1]], %[[CAST0]]] : memref<2x2xi32>
+// CHECK:           memref.store %[[LOAD0]], %[[ARG2]][%[[I]]] : memref<2xi32>
+
+// -----
+
+func.func @gather_inline_region(%arg0 : memref<2x2xi32>, %arg1 : memref<2x2xi32>, %arg2 : memref<2xi32>) {
+  %cst = arith.constant 3 : i32
+  iree_linalg_ext.gather
+    dimension_map = [0, 1]
+    ins(%arg0, %arg1: memref<2x2xi32>, memref<2x2xi32>)
+    outs(%arg2: memref<2xi32>) {
+    ^bb0(%bb0: i32, %bb1: i32):
+      %0 = arith.muli %bb0, %cst : i32
+      iree_linalg_ext.yield %0 : i32
+  }
+  return
+}
+// CHECK-LABEL: func @gather_inline_region
+// CHECK-SAME:    %[[ARG0:[a-zA-Z0-9]+]]
+// CHECK-SAME:    %[[ARG1:[a-zA-Z0-9]+]]
+// CHECK-SAME:    %[[ARG2:[a-zA-Z0-9]+]]
+// CHECK-DAG:     %[[C0:.+]] = arith.constant 0 : index
+// CHECK-DAG:     %[[C2:.+]] = arith.constant 2 : index
+// CHECK-DAG:     %[[C3:.+]] = arith.constant 3 : i32
+// CHECK-DAG:     %[[C1:.+]] = arith.constant 1 : index
+// CHECK:         scf.for %[[I:.+]] = %[[C0]] to %[[C2]] step %[[C1]] {
+// CHECK:           %[[IDX0:.+]] = memref.load %[[ARG1]][%[[I]], %[[C0]]] : memref<2x2xi32>
+// CHECK:           %[[CAST0:.+]] = arith.index_cast %[[IDX0]] : i32 to index
+// CHECK:           %[[IDX1:.+]] = memref.load %[[ARG1]][%[[I]], %[[C1]]] : memref<2x2xi32>
+// CHECK:           %[[CAST1:.+]] = arith.index_cast %[[IDX1]] : i32 to index
+// CHECK:           %[[LOAD0:.+]] = memref.load %[[ARG0]][%[[CAST0]], %[[CAST1]]] : memref<2x2xi32>
+// CHECK:           %[[MUL:.+]] = arith.muli %[[LOAD0]], %[[C3]] : i32
+// CHECK:           memref.store %[[MUL]], %[[ARG2]][%[[I]]] : memref<2xi32>

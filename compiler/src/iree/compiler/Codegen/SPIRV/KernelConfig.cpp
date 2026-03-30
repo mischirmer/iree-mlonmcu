@@ -13,8 +13,8 @@
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/LinalgOpInfo.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
-#include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
+#include "iree/compiler/Dialect/TensorExt/IR/TensorExtOps.h"
 #include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
@@ -86,7 +86,7 @@ static bool fusedOpMayUseExtraSharedMemory(linalg::LinalgOp matmul) {
 //===----------------------------------------------------------------------===//
 
 /// Decides the tiling and distribution parameters for one convolution
-/// dimension. Returns true if we can succesfully deduce.
+/// dimension. Returns true if we can successfully deduce.
 ///
 /// - `inputDim` is the size of the dimension to be distributed.
 /// - `residualThreads` is the remaining threads we can distribute.
@@ -126,7 +126,7 @@ static bool tileConvOneDim(const int64_t inputDim, const bool isInnerMostDim,
 
 /// Decides the tiling and distribution parameters for two convolution window
 /// dimensions to two workgroup dimensions as a square. Returns true if we can
-/// succesfully deduce.
+/// successfully deduce.
 static bool tileConvSquare(const int64_t oh, const int64_t ow,
                            int64_t &residualThreads,
                            int64_t &residualTilingFactor,
@@ -826,7 +826,7 @@ bool needToPrmoteCForCooperativeMatrix(linalg::LinalgOp matmulOp) {
   if (!result.hasOneUse())
     return true; // Be conservative.
   Operation *user = *result.getUsers().begin();
-  if (isa<IREE::Flow::DispatchTensorStoreOp>(user))
+  if (isa<IREE::TensorExt::DispatchTensorStoreOp>(user))
     return false;
   if (auto genericOp = dyn_cast<linalg::GenericOp>(user)) {
     return !isCooperativeMatrixFusable(genericOp);

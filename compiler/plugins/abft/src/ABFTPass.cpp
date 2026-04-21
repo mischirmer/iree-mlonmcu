@@ -55,6 +55,11 @@ static llvm::cl::opt<int> abftInjectFaultDelta(
     llvm::cl::desc("Delta added to injected ABFT fault (quantized i32 path)"),
     llvm::cl::init(1));
 
+static llvm::cl::opt<int> abftInjectFaultLayer(
+    "abft-inject-fault-layer",
+    llvm::cl::desc("Target layer ordinal for fault injection (-1: all layers)"),
+    llvm::cl::init(-1));
+
 static llvm::cl::opt<std::string> abftInjectFaultPattern(
   "abft-inject-fault-pattern",
   llvm::cl::desc(
@@ -1178,7 +1183,9 @@ module {
 
         // Fault injection must mutate the produced matmul result (not just the
         // checksum path), so downstream users observe the injected fault.
-        if (abftInjectFault) {
+        if (abftInjectFault &&
+            (abftInjectFaultLayer < 0 ||
+             currentLayer == static_cast<int64_t>(abftInjectFaultLayer))) {
           StringRef pattern = abftInjectFaultPattern.getValue();
           StringRef injectFn = "apply_fault_i32_single_point";
           if (pattern == "trivial") {
@@ -1583,7 +1590,9 @@ module {
 
                 Value initI32 = (op->getNumOperands() > 2) ? toI32(op->getOperand(2)) : Value();
 
-                if (abftInjectFault) {
+                if (abftInjectFault &&
+                    (abftInjectFaultLayer < 0 ||
+                     currentLayer == static_cast<int64_t>(abftInjectFaultLayer))) {
                 StringRef pattern = abftInjectFaultPattern.getValue();
                 StringRef injectFn = "apply_fault_i32_single_point";
                 if (pattern == "trivial") {
@@ -1909,7 +1918,9 @@ module {
       }
 
       Value compareForChecks = compare2d;
-      if (abftInjectFault) {
+      if (abftInjectFault &&
+          (abftInjectFaultLayer < 0 ||
+           currentLayer == static_cast<int64_t>(abftInjectFaultLayer))) {
         StringRef pattern = abftInjectFaultPattern.getValue();
         Value c0 = bAfter.create<arith::ConstantIndexOp>(loc, 0);
         Value c1 = bAfter.create<arith::ConstantIndexOp>(loc, 1);

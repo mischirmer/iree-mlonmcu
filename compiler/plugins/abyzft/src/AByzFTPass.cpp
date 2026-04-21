@@ -98,6 +98,11 @@ static llvm::cl::opt<int> abyzftInjectFaultDelta(
     llvm::cl::desc("Fault injection additive delta"),
     llvm::cl::init(1));
 
+static llvm::cl::opt<int> abyzftInjectFaultLayer(
+    "abyzft-inject-fault-layer",
+    llvm::cl::desc("Target layer ordinal for fault injection (-1: all layers)"),
+    llvm::cl::init(-1));
+
 static llvm::cl::opt<std::string> abyzftInjectFaultPattern(
     "abyzft-inject-fault-pattern",
     llvm::cl::desc("Fault injection pattern: single_point, trivial, checkered"),
@@ -1897,7 +1902,10 @@ module {
 
         builder.setInsertionPointAfter(matmul);
         Value scaledMatmulResult = matmul.getResult(0);
-        if (abyzftInjectFault) {
+        if (abyzftInjectFault &&
+            (abyzftInjectFaultLayer < 0 ||
+             static_cast<int64_t>(matmulIndex) ==
+                 static_cast<int64_t>(abyzftInjectFaultLayer))) {
           scaledMatmulResult = applyAByzFTFault(builder, loc, scaledMatmulResult,
                                                 abyzftInjectFaultDelta,
                                                 abyzftInjectFaultPattern.getValue());
@@ -2090,7 +2098,10 @@ module {
         Value scaledResultDyn = outType != dyn2dTy
                                     ? builder.create<tensor::CastOp>(loc, dyn2dTy, matmul.getResult(0)).getResult()
                                     : matmul.getResult(0);
-        if (abyzftInjectFault) {
+        if (abyzftInjectFault &&
+            (abyzftInjectFaultLayer < 0 ||
+             static_cast<int64_t>(matmulIndex) ==
+                 static_cast<int64_t>(abyzftInjectFaultLayer))) {
           scaledResultDyn = applyAByzFTFault(builder, loc, scaledResultDyn,
                                              abyzftInjectFaultDelta,
                                              abyzftInjectFaultPattern.getValue());
@@ -2280,7 +2291,10 @@ module {
 
       builder.setInsertionPointAfter(matmul);
       Value scaledMatmulResult = matmul.getResult(0);
-      if (abyzftInjectFault) {
+      if (abyzftInjectFault &&
+          (abyzftInjectFaultLayer < 0 ||
+           static_cast<int64_t>(matmulIndex) ==
+               static_cast<int64_t>(abyzftInjectFaultLayer))) {
         scaledMatmulResult = applyAByzFTFault(builder, loc, scaledMatmulResult,
                                               abyzftInjectFaultDelta,
                                               abyzftInjectFaultPattern.getValue());
@@ -2901,7 +2915,10 @@ module {
 
       builder.setInsertionPointAfter(qmatmul);
       Value qOut = qmatmul.getResult(0);
-      if (abyzftInjectFault) {
+      if (abyzftInjectFault &&
+          (abyzftInjectFaultLayer < 0 ||
+           static_cast<int64_t>(targets.size() + qIndex) ==
+               static_cast<int64_t>(abyzftInjectFaultLayer))) {
         qOut = applyAByzFTFault(builder, loc, qOut, abyzftInjectFaultDelta,
                                 abyzftInjectFaultPattern.getValue());
         qmatmul.emitRemark() << "abyzft-qmatmul: injected "

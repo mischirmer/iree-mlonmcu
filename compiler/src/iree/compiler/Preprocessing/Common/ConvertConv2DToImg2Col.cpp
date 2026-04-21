@@ -232,6 +232,254 @@ public:
   }
 };
 
+// Quantized variant of NHWC/HWCF convolution lowered to img2col +
+// linalg.quantized_matmul. This mirrors the floating-point conversion above
+// while preserving explicit input/kernel zero-point operands.
+class ConvertConv2DNhwcHwcfQ final
+    : public OpRewritePattern<linalg::Conv2DNhwcHwcfQOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::Conv2DNhwcHwcfQOp convOp,
+                                PatternRewriter &rewriter) const override {
+    auto inputType =
+        llvm::cast<RankedTensorType>(convOp.getInputs()[0].getType());
+    auto filterType =
+        llvm::cast<RankedTensorType>(convOp.getInputs()[1].getType());
+    auto outputType =
+        llvm::cast<RankedTensorType>(convOp.getOutputs()[0].getType());
+
+    if (!filterType.hasStaticShape()) {
+      return rewriter.notifyMatchFailure(convOp, [](Diagnostic &diag) {
+        diag << "[unimplemented] expected static filter for quant img2col";
+      });
+    }
+    auto inShape = inputType.getShape();
+    auto outShape = outputType.getShape();
+    if (inShape.size() != 4 || outShape.size() != 4)
+      return rewriter.notifyMatchFailure(convOp, "expected rank-4 NHWC tensors");
+    if (ShapedType::isDynamic(inShape[1]) || ShapedType::isDynamic(inShape[2]) ||
+        ShapedType::isDynamic(inShape[3]) || ShapedType::isDynamic(outShape[1]) ||
+        ShapedType::isDynamic(outShape[2]) || ShapedType::isDynamic(outShape[3])) {
+      return rewriter.notifyMatchFailure(convOp, [](Diagnostic &diag) {
+        diag << "[unimplemented] expected static H/W/C and output H/W/F";
+      });
+    }
+
+    if (!hasAllOneValues(convOp.getDilations())) {
+      return rewriter.notifyMatchFailure(convOp, [](Diagnostic &diag) {
+        diag << "[unimplemented] expected unit dilation for quant img2col";
+      });
+    }
+
+    Value input = convOp.getInputs()[0];
+    Value filter = convOp.getInputs()[1];
+    Value inputZp = convOp.getInputs()[2];
+    Value kernelZp = convOp.getInputs()[3];
+    Value output = convOp.getOutputs()[0];
+
+    auto filterShape = filterType.getShape();
+    auto outputShape = outputType.getShape();
+
+    const int64_t n = outputShape[0];
+    const int64_t oh = outputShape[1];
+    const int64_t ow = outputShape[2];
+    const int64_t oc = outputShape[3];
+    const int64_t fh = filterShape[0];
+    const int64_t fw = filterShape[1];
+    const int64_t ic = filterShape[2];
+
+    auto loc = convOp.getLoc();
+
+    SmallVector<int64_t> colTensorShape = {n, oh, ow, fh, fw, ic};
+    SmallVector<OpFoldResult> colMixedSizes;
+    colMixedSizes.reserve(colTensorShape.size());
+    for (size_t i = 0; i < colTensorShape.size(); ++i) {
+      if (ShapedType::isDynamic(colTensorShape[i])) {
+        colMixedSizes.push_back(
+            rewriter.create<tensor::DimOp>(loc, output, i).getResult());
+      } else {
+        colMixedSizes.push_back(rewriter.getIndexAttr(colTensorShape[i]));
+      }
+    }
+    Value colTensor = rewriter.create<tensor::EmptyOp>(
+        loc, colMixedSizes, inputType.getElementType());
+
+    AffineExpr nDim, ohDim, owDim, khDim, kwDim, icDim;
+    bindDims(getContext(), nDim, ohDim, owDim, khDim, kwDim, icDim);
+    auto shSym = rewriter.getAffineConstantExpr(
+        convOp.getStrides().getValues<int64_t>()[0]);
+    auto swSym = rewriter.getAffineConstantExpr(
+        convOp.getStrides().getValues<int64_t>()[1]);
+    SmallVector<AffineExpr> inputExprs = {nDim, ohDim * shSym + khDim,
+                                          owDim * swSym + kwDim, icDim};
+
+    auto nloops = colTensorShape.size();
+    SmallVector<utils::IteratorType, 6> img2colIterators(
+        nloops, utils::IteratorType::parallel);
+    SmallVector<AffineMap> img2colIndexingMaps = {
+        AffineMap::get(nloops, 0, inputExprs, rewriter.getContext()),
+        AffineMap::getMultiDimIdentityMap(nloops, rewriter.getContext())};
+    auto img2ColTensor = rewriter.create<linalg::GenericOp>(
+        loc, colTensor.getType(), /*inputs=*/input, /*outputs=*/colTensor,
+        img2colIndexingMaps, img2colIterators,
+        [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
+          nestedBuilder.create<linalg::YieldOp>(nestedLoc, args[0]);
+        });
+
+    SmallVector<ReassociationIndices> img2ColTensorReassocIndices = {
+        {0, 1, 2}, {3, 4, 5}};
+    SmallVector<ReassociationIndices> outputReassocIndices = {
+        {0, 1, 2}, {3}};
+    RankedTensorType reshapedImg2ColTensorType = RankedTensorType::get(
+        {ShapedType::kDynamic, fh * fw * ic}, inputType.getElementType());
+    RankedTensorType reshapedOutputType = RankedTensorType::get(
+        {ShapedType::kDynamic, oc}, outputType.getElementType());
+
+    SmallVector<ReassociationIndices> filterReassocIndices = {{0, 1, 2}, {3}};
+    auto reshapedFilterType =
+        RankedTensorType::get({fh * fw * ic, oc}, filterType.getElementType());
+
+    Value reshapedImg2ColTensor = rewriter.create<tensor::CollapseShapeOp>(
+        loc, reshapedImg2ColTensorType, img2ColTensor.getResult(0),
+        img2ColTensorReassocIndices);
+    Value reshapedFilter = rewriter.create<tensor::CollapseShapeOp>(
+        loc, reshapedFilterType, filter, filterReassocIndices);
+    Value reshapedOutput = rewriter.create<tensor::CollapseShapeOp>(
+        loc, reshapedOutputType, output, outputReassocIndices);
+
+    auto qmm = rewriter.create<linalg::QuantizedMatmulOp>(
+        loc, reshapedOutputType,
+        ArrayRef<Value>{reshapedImg2ColTensor, reshapedFilter, inputZp,
+                        kernelZp},
+        ArrayRef<Value>{reshapedOutput});
+    Value result = qmm.getResults().front();
+
+    auto reshapedResult = rewriter.create<tensor::ExpandShapeOp>(
+        loc, outputType, result, outputReassocIndices);
+    rewriter.replaceOp(convOp, ArrayRef<Value>{reshapedResult});
+    return success();
+  }
+};
+
+// Rewrite depthwise quantized NHWC/HWCM conv into an equivalent quantized
+// NHWC/HWCF conv by materializing a channel-expanded filter. A subsequent
+// ConvertConv2DNhwcHwcfQ pattern application lowers it to img2col+qmatmul.
+class ConvertDepthwiseConv2DNhwcHwcmQ final
+    : public OpRewritePattern<linalg::DepthwiseConv2DNhwcHwcmQOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::DepthwiseConv2DNhwcHwcmQOp convOp,
+                                PatternRewriter &rewriter) const override {
+    auto inputType =
+        llvm::cast<RankedTensorType>(convOp.getInputs()[0].getType());
+    auto filterType =
+        llvm::cast<RankedTensorType>(convOp.getInputs()[1].getType());
+    auto outputType =
+        llvm::cast<RankedTensorType>(convOp.getOutputs()[0].getType());
+    if (!filterType.hasStaticShape() || !inputType.hasRank() ||
+        inputType.getRank() != 4 || outputType.getRank() != 5) {
+      return rewriter.notifyMatchFailure(
+          convOp,
+          "expected rank-4 input, rank-5 output (NHWCM), and static depthwise "
+          "filter");
+    }
+    if (!hasAllOneValues(convOp.getDilations())) {
+      return rewriter.notifyMatchFailure(convOp, [](Diagnostic &diag) {
+        diag << "[unimplemented] expected unit dilation for depthwise q img2col";
+      });
+    }
+
+    auto inShape = inputType.getShape();
+    auto outShape = outputType.getShape(); // [N, OH, OW, C, M]
+    auto fShape = filterType.getShape(); // [fh, fw, ic, m]
+    if (ShapedType::isDynamic(inShape[3]) || ShapedType::isDynamic(outShape[3]) ||
+        ShapedType::isDynamic(outShape[4]))
+      return rewriter.notifyMatchFailure(
+          convOp, "expected static input/output channels for depthwise conversion");
+
+    int64_t fh = fShape[0];
+    int64_t fw = fShape[1];
+    int64_t ic = fShape[2];
+    int64_t m = fShape[3];
+    int64_t outC = outShape[3];
+    int64_t outM = outShape[4];
+    int64_t oc = outC * outM;
+    if (ShapedType::isDynamic(fh) || ShapedType::isDynamic(fw) ||
+        ShapedType::isDynamic(ic) || ShapedType::isDynamic(m) ||
+        ic * m != oc || outC != ic || outM != m) {
+      return rewriter.notifyMatchFailure(
+          convOp,
+          "expected static depthwise filter and compatible NHWCM output shape");
+    }
+
+    Location loc = convOp.getLoc();
+    Type elemType = filterType.getElementType();
+    auto expandedFilterType = RankedTensorType::get({fh, fw, ic, oc}, elemType);
+    Value expandedFilterInit =
+        rewriter.create<tensor::EmptyOp>(loc, expandedFilterType.getShape(), elemType);
+    Value zero = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(elemType));
+    Value expandedFilterZero = rewriter.create<linalg::FillOp>(
+                                    loc, ValueRange{zero},
+                                    ValueRange{expandedFilterInit})
+                                   .getResult(0);
+
+    AffineExpr d0, d1, d2, d3;
+    bindDims(getContext(), d0, d1, d2, d3);
+    auto inMap = AffineMap::get(
+        4, 0, {d0, d1, d2, d3 % rewriter.getAffineConstantExpr(m)}, getContext());
+    auto outMap = AffineMap::getMultiDimIdentityMap(4, getContext());
+    SmallVector<utils::IteratorType> iters(4, utils::IteratorType::parallel);
+    Value expandedFilter = rewriter
+                               .create<linalg::GenericOp>(
+                                   loc, expandedFilterType,
+                                   ValueRange{convOp.getInputs()[1]},
+                                   ValueRange{expandedFilterZero},
+                                   ArrayRef<AffineMap>{inMap, outMap}, iters,
+                                   [&](OpBuilder &b, Location nestedLoc,
+                                       ValueRange args) {
+                                     Value srcVal = args[0];
+                                     Value outVal = args[1];
+                                     Value ocIdx = b.create<linalg::IndexOp>(nestedLoc, 3);
+                                     Value icIdx = b.create<linalg::IndexOp>(nestedLoc, 2);
+                                     Value mConst =
+                                         b.create<arith::ConstantIndexOp>(nestedLoc, m);
+                                     Value ocDivM =
+                                         b.create<arith::DivUIOp>(nestedLoc, ocIdx, mConst);
+                                     Value isMatch = b.create<arith::CmpIOp>(
+                                         nestedLoc, arith::CmpIPredicate::eq, ocDivM, icIdx);
+                                     Value chosen = b.create<arith::SelectOp>(
+                                         nestedLoc, isMatch, srcVal, outVal);
+                                     b.create<linalg::YieldOp>(nestedLoc, chosen);
+                                   })
+                               .getResult(0);
+
+    Value input = convOp.getInputs()[0];
+    Value inZp = convOp.getInputs()[2];
+    Value kerZp = convOp.getInputs()[3];
+    Value output = convOp.getOutputs()[0];
+
+    SmallVector<ReassociationIndices> outputCollapseReassoc = {
+        {0}, {1}, {2}, {3, 4}};
+    auto collapsedOutputType =
+        RankedTensorType::get({outShape[0], outShape[1], outShape[2], oc},
+                              outputType.getElementType());
+    Value collapsedOutput = rewriter.create<tensor::CollapseShapeOp>(
+        loc, collapsedOutputType, output, outputCollapseReassoc);
+
+    auto replacement = rewriter.create<linalg::Conv2DNhwcHwcfQOp>(
+        loc, collapsedOutputType,
+        ArrayRef<Value>{input, expandedFilter, inZp, kerZp},
+        ArrayRef<Value>{collapsedOutput});
+
+    Value expandedResult = rewriter.create<tensor::ExpandShapeOp>(
+        loc, outputType, replacement.getResult(0), outputCollapseReassoc);
+    rewriter.replaceOp(convOp, expandedResult);
+    return success();
+  }
+};
+
 // Similar to the conv pattern above except there is no reduction among the
 // input channels so each convolution can be a matrix-vector product and
 // by transposing both input filter so channels are outer most the computation
@@ -558,8 +806,10 @@ class ConvertConv2DToImg2ColPass
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(&getContext());
-    patterns.insert<ConvertConv2DNhwcHwcf, ConvertDepthwiseConv2DNhwcHwc,
-                    ConvertConv2DNchwFchw>(context);
+    patterns.insert<ConvertConv2DNhwcHwcf, ConvertConv2DNhwcHwcfQ,
+                    ConvertDepthwiseConv2DNhwcHwc,
+                    ConvertDepthwiseConv2DNhwcHwcmQ, ConvertConv2DNchwFchw>(
+        context);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }

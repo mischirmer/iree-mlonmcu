@@ -21,6 +21,9 @@
 
 #include <cstdlib>
 #include <cmath>
+#include <limits>
+#include <algorithm>
+#include <functional>
 #include <vector>
 
 using namespace mlir;
@@ -35,9 +38,55 @@ constexpr StringLiteral kAbftModeFreivald = "freivald";
 static llvm::cl::opt<int> abyzftScaleSamplingMode(
   "abyzft-scale-sampling-mode",
   llvm::cl::desc(
-    "Scale sampling mode: 1=uniform from [-4,-0.5]U[0.5,4], "
-    "2=uniform from {-4,-2,-0.5,0.5,2,4}"),
+    "Scale sampling mode (type-aware): "
+    "float: 1=uniform from [-max,-min]U[min,max], 2=uniform from [min,max], 3=discrete list; "
+    "int/uint: 1=discrete list, 2=uniform int range [min,max], 3=uniform int range [1,2^bits-1]"),
   llvm::cl::init(1));
+
+static llvm::cl::opt<double> abyzftFloatDisjointMinAbs(
+    "abyzft-float-disjoint-min-abs",
+    llvm::cl::desc("Min absolute value for float disjoint sampling mode"),
+    llvm::cl::init(0.5));
+
+static llvm::cl::opt<double> abyzftFloatDisjointMaxAbs(
+    "abyzft-float-disjoint-max-abs",
+    llvm::cl::desc("Max absolute value for float disjoint sampling mode"),
+    llvm::cl::init(2.0));
+
+static llvm::cl::opt<double> abyzftFloatRangeMin(
+    "abyzft-float-range-min",
+    llvm::cl::desc("Min value for float full-range sampling mode"),
+    llvm::cl::init(-2.0));
+
+static llvm::cl::opt<double> abyzftFloatRangeMax(
+    "abyzft-float-range-max",
+    llvm::cl::desc("Max value for float full-range sampling mode"),
+    llvm::cl::init(2.0));
+
+static llvm::cl::opt<std::string> abyzftFloatDiscreteList(
+    "abyzft-float-discrete-list",
+    llvm::cl::desc("Comma-separated float scale choices for discrete float mode"),
+    llvm::cl::init("-8,-4,-2,2,4,8"));
+
+static llvm::cl::opt<std::string> abyzftIntDiscreteList(
+    "abyzft-int-discrete-list",
+    llvm::cl::desc("Comma-separated integer scale choices for discrete int/uint mode"),
+    llvm::cl::init("1,2,4"));
+
+static llvm::cl::opt<int64_t> abyzftIntRangeMin(
+    "abyzft-int-range-min",
+    llvm::cl::desc("Min integer value for int/uint range sampling mode"),
+    llvm::cl::init(1));
+
+static llvm::cl::opt<int64_t> abyzftIntRangeMax(
+    "abyzft-int-range-max",
+    llvm::cl::desc("Max integer value for int/uint range sampling mode"),
+    llvm::cl::init(8));
+
+static llvm::cl::opt<int64_t> abyzftIntBitsMax(
+    "abyzft-int-bits-max",
+    llvm::cl::desc("Bit-width cap for int/uint bit-range sampling mode (samples [1,2^bits-1])"),
+    llvm::cl::init(2));
 
 static llvm::cl::opt<bool> abyzftInjectFault(
     "abyzft-inject-fault",
@@ -54,24 +103,52 @@ static llvm::cl::opt<std::string> abyzftInjectFaultPattern(
     llvm::cl::desc("Fault injection pattern: single_point, trivial, checkered"),
     llvm::cl::init("single_point"));
 
+template <typename T>
+static SmallVector<T> parseCsvList(StringRef csv, std::function<FailureOr<T>(StringRef)> parser) {
+  SmallVector<T> values;
+  SmallVector<StringRef> parts;
+  csv.split(parts, ',', -1, false);
+  for (StringRef raw : parts) {
+    StringRef tok = raw.trim();
+    if (tok.empty()) continue;
+    FailureOr<T> parsed = parser(tok);
+    if (succeeded(parsed)) values.push_back(*parsed);
+  }
+  return values;
+}
+
 static double sampleScaleValue(Operation *anchor) {
-  constexpr double kMinAbsScale = 0.5;
-  constexpr double kMaxAbsScale = 4.0;
+  const double minAbs = std::max(0.0, static_cast<double>(abyzftFloatDisjointMinAbs));
+  const double maxAbs = std::max(minAbs, static_cast<double>(abyzftFloatDisjointMaxAbs));
+  const double rangeMin = static_cast<double>(abyzftFloatRangeMin);
+  const double rangeMax = std::max(rangeMin, static_cast<double>(abyzftFloatRangeMax));
   if (abyzftScaleSamplingMode == 1) {
     double unit = static_cast<double>(rand()) / static_cast<double>(RAND_MAX);
-    double magnitude = kMinAbsScale + (kMaxAbsScale - kMinAbsScale) * unit;
+    double magnitude = minAbs + (maxAbs - minAbs) * unit;
     double sign = (rand() % 2 == 0) ? -1.0 : 1.0;
     return sign * magnitude;
   }
   if (abyzftScaleSamplingMode == 2) {
-    constexpr double kScaleChoices[] = {-4.0, -2.0, -0.5, 0.5, 2.0, 4.0};
-    int choice = rand() % (sizeof(kScaleChoices) / sizeof(kScaleChoices[0]));
-    return kScaleChoices[choice];
+    double unit = static_cast<double>(rand()) / static_cast<double>(RAND_MAX);
+    return rangeMin + (rangeMax - rangeMin) * unit;
+  }
+  if (abyzftScaleSamplingMode == 3) {
+    auto values = parseCsvList<double>(abyzftFloatDiscreteList.getValue(), [](StringRef tok) -> FailureOr<double> {
+      double v = 0.0;
+      if (tok.getAsDouble(v)) return failure();
+      if (v == 0.0) return failure();
+      return v;
+    });
+    if (!values.empty()) return values[rand() % values.size()];
+    anchor->emitRemark("Empty/invalid --abyzft-float-discrete-list; defaulting to -8,-4,-2,2,4,8");
+    constexpr double kDefaultChoices[] = {-8.0, -4.0, -2.0, 2.0, 4.0, 8.0};
+    int choice = rand() % (sizeof(kDefaultChoices) / sizeof(kDefaultChoices[0]));
+    return kDefaultChoices[choice];
   }
   anchor->emitRemark(
       "Unknown --abyzft-scale-sampling-mode; defaulting to mode 1");
   double unit = static_cast<double>(rand()) / static_cast<double>(RAND_MAX);
-  double magnitude = kMinAbsScale + (kMaxAbsScale - kMinAbsScale) * unit;
+  double magnitude = minAbs + (maxAbs - minAbs) * unit;
   double sign = (rand() % 2 == 0) ? -1.0 : 1.0;
   return sign * magnitude;
 }
@@ -81,6 +158,59 @@ static SmallVector<double> sampleScaleVector(Operation *anchor, int64_t size) {
   values.reserve(size);
   for (int64_t i = 0; i < size; ++i) {
     values.push_back(sampleScaleValue(anchor));
+  }
+  return values;
+}
+
+static int64_t sampleIntScaleValue(Operation *anchor) {
+  // Must be non-zero because AByzFT descaling divides by the sampled scale.
+  // Including 0 makes fault-free runs numerically unstable/undefined.
+  if (abyzftScaleSamplingMode == 1) {
+    auto values = parseCsvList<int64_t>(abyzftIntDiscreteList.getValue(), [](StringRef tok) -> FailureOr<int64_t> {
+      int64_t v = 0;
+      if (tok.getAsInteger(10, v)) return failure();
+      if (v == 0) return failure();
+      return v;
+    });
+    if (!values.empty()) return values[rand() % values.size()];
+    anchor->emitRemark("Empty/invalid --abyzft-int-discrete-list; defaulting to 1,2,4");
+    constexpr int64_t kDefaultChoices[] = {1, 2, 4};
+    int choice = rand() % (sizeof(kDefaultChoices) / sizeof(kDefaultChoices[0]));
+    return kDefaultChoices[choice];
+  }
+  if (abyzftScaleSamplingMode == 2) {
+    int64_t minV = static_cast<int64_t>(abyzftIntRangeMin);
+    int64_t maxV = static_cast<int64_t>(abyzftIntRangeMax);
+    if (minV > maxV) std::swap(minV, maxV);
+    if (minV <= 0 && maxV >= 0) {
+      if (maxV == 0) return -1;
+      if (minV == 0) return 1;
+    }
+    int64_t span = maxV - minV + 1;
+    if (span <= 0) return 1;
+    int64_t sampled = minV + (rand() % span);
+    if (sampled == 0) sampled = (sampled == maxV) ? sampled - 1 : sampled + 1;
+    return sampled;
+  }
+  if (abyzftScaleSamplingMode == 3) {
+    int64_t bits = std::max<int64_t>(1, static_cast<int64_t>(abyzftIntBitsMax));
+    bits = std::min<int64_t>(bits, 62);
+    int64_t maxV = (int64_t{1} << bits) - 1;
+    if (maxV <= 1) return 1;
+    return 1 + (rand() % maxV);
+  }
+  anchor->emitRemark(
+      "Unknown --abyzft-scale-sampling-mode; defaulting to mode 1");
+  constexpr int64_t kDefaultChoices[] = {1, 2, 4};
+  int choice = rand() % (sizeof(kDefaultChoices) / sizeof(kDefaultChoices[0]));
+  return kDefaultChoices[choice];
+}
+
+static SmallVector<int64_t> sampleIntScaleVector(Operation *anchor, int64_t size) {
+  SmallVector<int64_t> values;
+  values.reserve(size);
+  for (int64_t i = 0; i < size; ++i) {
+    values.push_back(sampleIntScaleValue(anchor));
   }
   return values;
 }
@@ -108,6 +238,24 @@ static DenseFPElementsAttr buildSplatTensorAttr(RankedTensorType type,
   auto numElements = type.getNumElements();
   SmallVector<double> values(numElements, value);
   return buildDenseTensorAttr(type, values);
+}
+
+static DenseElementsAttr buildDenseIntTensorAttr(RankedTensorType type,
+                                                 ArrayRef<int64_t> values) {
+  auto elementType = llvm::cast<IntegerType>(type.getElementType());
+  SmallVector<Attribute> attrs;
+  attrs.reserve(values.size());
+  for (int64_t value : values) {
+    attrs.push_back(IntegerAttr::get(elementType, value));
+  }
+  return DenseElementsAttr::get(type, attrs);
+}
+
+static DenseElementsAttr buildSplatIntTensorAttr(RankedTensorType type,
+                                                 int64_t value) {
+  auto numElements = type.getNumElements();
+  SmallVector<int64_t> values(numElements, value);
+  return buildDenseIntTensorAttr(type, values);
 }
 
 static SmallVector<double> getDenseValues(DenseFPElementsAttr dense) {
@@ -193,12 +341,55 @@ static Value buildSplatTensorConstant(OpBuilder &builder, Location loc,
   return builder.create<arith::ConstantOp>(loc, type, denseAttr);
 }
 
+static Value buildSplatIntTensorConstant(OpBuilder &builder, Location loc,
+                                         RankedTensorType type, int64_t value) {
+  auto denseAttr = buildSplatIntTensorAttr(type, value);
+  return builder.create<arith::ConstantOp>(loc, type, denseAttr);
+}
+
+static Value buildZeroTensorLike(OpBuilder &builder, Location loc, Value matrix,
+                                 RankedTensorType resultType) {
+  auto elementType = resultType.getElementType();
+  Value empty = (resultType.hasStaticShape())
+                      ? builder.create<tensor::EmptyOp>(loc, resultType,
+                                                        ValueRange{})
+                            .getResult()
+                      : [&]() {
+                          SmallVector<Value> dynamicSizes;
+                          for (size_t i = 0; i < resultType.getRank(); ++i) {
+                            if (resultType.isDynamicDim(i)) {
+                              Value dimIndex =
+                                  builder.create<arith::ConstantIndexOp>(loc, i);
+                              dynamicSizes.push_back(
+                                  builder.create<tensor::DimOp>(loc, matrix, dimIndex));
+                            }
+                          }
+                          return builder
+                              .create<tensor::EmptyOp>(loc, resultType, dynamicSizes)
+                              .getResult();
+                        }();
+  Value zero = builder.create<arith::ConstantOp>(
+      loc, elementType, builder.getZeroAttr(elementType));
+  return builder.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{empty})
+      .getResult(0);
+}
+
+static Value buildFilledIntVectorConstant(OpBuilder &builder, Location loc,
+                                          Value size, IntegerType elementType,
+                                          int64_t value) {
+  auto vectorType = RankedTensorType::get({ShapedType::kDynamic}, elementType);
+  Value empty = builder.create<tensor::EmptyOp>(loc, vectorType, SmallVector<Value>{size})
+                    .getResult();
+  Value fillValue = builder.create<arith::ConstantOp>(
+      loc, elementType, builder.getIntegerAttr(elementType, value));
+  return builder.create<linalg::FillOp>(loc, ValueRange{fillValue}, ValueRange{empty})
+      .getResult(0);
+}
+
 static Value buildScaleRows(OpBuilder &builder, Location loc, Value matrix,
                             Value scales, RankedTensorType resultType) {
   auto elementType = resultType.getElementType();
-  auto zeroAttr = builder.getFloatAttr(elementType, 0.0);
-  Value init = builder.create<arith::ConstantOp>(
-      loc, resultType, DenseElementsAttr::get(resultType, zeroAttr));
+  Value init = buildZeroTensorLike(builder, loc, matrix, resultType);
   return builder
       .create<linalg::GenericOp>(
           loc, TypeRange{resultType}, ValueRange{matrix, scales}, ValueRange{init},
@@ -209,9 +400,26 @@ static Value buildScaleRows(OpBuilder &builder, Location loc, Value matrix,
               AffineMap::getMultiDimIdentityMap(2, builder.getContext())},
           SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
                                            utils::IteratorType::parallel},
-          [](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
-            Value scaled =
-                nestedBuilder.create<arith::MulFOp>(nestedLoc, args[0], args[1]);
+          [elementType](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
+            Value matVal = args[0];
+            Value scaleVal = args[1];
+            Value scaled;
+            
+            if (llvm::isa<FloatType>(elementType)) {
+              if (scaleVal.getType() != elementType) {
+                scaleVal = nestedBuilder.create<arith::ExtSIOp>(nestedLoc, elementType, scaleVal).getResult();
+              }
+              scaled = nestedBuilder.create<arith::MulFOp>(nestedLoc, matVal, scaleVal).getResult();
+            } else {
+              // For integers, promote to i32 to avoid overflow during multiplication
+              auto i32Type = nestedBuilder.getI32Type();
+              Value matPromoted = nestedBuilder.create<arith::ExtSIOp>(nestedLoc, i32Type, matVal).getResult();
+              if (scaleVal.getType() != i32Type) {
+                scaleVal = nestedBuilder.create<arith::ExtSIOp>(nestedLoc, i32Type, scaleVal).getResult();
+              }
+              Value mulResult = nestedBuilder.create<arith::MulIOp>(nestedLoc, matPromoted, scaleVal).getResult();
+              scaled = nestedBuilder.create<arith::TruncIOp>(nestedLoc, elementType, mulResult).getResult();
+            }
             nestedBuilder.create<linalg::YieldOp>(nestedLoc, scaled);
           })
       .getResult(0);
@@ -220,9 +428,7 @@ static Value buildScaleRows(OpBuilder &builder, Location loc, Value matrix,
 static Value buildScaleCols(OpBuilder &builder, Location loc, Value matrix,
                             Value scales, RankedTensorType resultType) {
   auto elementType = resultType.getElementType();
-  auto zeroAttr = builder.getFloatAttr(elementType, 0.0);
-  Value init = builder.create<arith::ConstantOp>(
-      loc, resultType, DenseElementsAttr::get(resultType, zeroAttr));
+  Value init = buildZeroTensorLike(builder, loc, matrix, resultType);
   return builder
       .create<linalg::GenericOp>(
           loc, TypeRange{resultType}, ValueRange{matrix, scales}, ValueRange{init},
@@ -233,21 +439,132 @@ static Value buildScaleCols(OpBuilder &builder, Location loc, Value matrix,
               AffineMap::getMultiDimIdentityMap(2, builder.getContext())},
           SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
                                            utils::IteratorType::parallel},
-          [](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
-            Value scaled =
-                nestedBuilder.create<arith::MulFOp>(nestedLoc, args[0], args[1]);
+          [elementType](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
+            Value matVal = args[0];
+            Value scaleVal = args[1];
+            Value scaled;
+            
+            if (llvm::isa<FloatType>(elementType)) {
+              if (scaleVal.getType() != elementType) {
+                scaleVal = nestedBuilder.create<arith::ExtSIOp>(nestedLoc, elementType, scaleVal).getResult();
+              }
+              scaled = nestedBuilder.create<arith::MulFOp>(nestedLoc, matVal, scaleVal).getResult();
+            } else {
+              // For integers, promote to i32 to avoid overflow during multiplication
+              auto i32Type = nestedBuilder.getI32Type();
+              Value matPromoted = nestedBuilder.create<arith::ExtSIOp>(nestedLoc, i32Type, matVal).getResult();
+              if (scaleVal.getType() != i32Type) {
+                scaleVal = nestedBuilder.create<arith::ExtSIOp>(nestedLoc, i32Type, scaleVal).getResult();
+              }
+              Value mulResult = nestedBuilder.create<arith::MulIOp>(nestedLoc, matPromoted, scaleVal).getResult();
+              scaled = nestedBuilder.create<arith::TruncIOp>(nestedLoc, elementType, mulResult).getResult();
+            }
             nestedBuilder.create<linalg::YieldOp>(nestedLoc, scaled);
           })
       .getResult(0);
 }
 
+      // Cast a scale vector to a target element type using linalg.generic.
+static Value castVectorToType(OpBuilder &builder, Location loc, Value vector,
+                              Type targetElementType) {
+  auto vectorType = llvm::dyn_cast<RankedTensorType>(vector.getType());
+  if (!vectorType || vectorType.getElementType() == targetElementType) {
+    return vector;
+  }
+  auto resultType = RankedTensorType::get(vectorType.getShape(), targetElementType);
+  Value init = resultType.hasStaticShape()
+                   ? builder.create<tensor::EmptyOp>(loc, resultType,
+                                                     ValueRange{})
+                         .getResult()
+                   : [&]() {
+                       Value c0 = builder.create<arith::ConstantIndexOp>(loc, 0);
+                       Value size = builder.create<tensor::DimOp>(loc, vector, c0);
+                       return builder
+                           .create<tensor::EmptyOp>(loc, resultType,
+                                                    SmallVector<Value>{size})
+                           .getResult();
+                     }();
+  return builder
+      .create<linalg::GenericOp>(
+          loc, TypeRange{resultType}, ValueRange{vector}, ValueRange{init},
+          SmallVector<AffineMap>{
+              AffineMap::get(1, 0, {builder.getAffineDimExpr(0)},
+                             builder.getContext()),
+              AffineMap::get(1, 0, {builder.getAffineDimExpr(0)},
+                             builder.getContext())},
+          SmallVector<utils::IteratorType>{utils::IteratorType::parallel},
+          [targetElementType](OpBuilder &nestedBuilder, Location nestedLoc,
+                              ValueRange args) {
+            Value casted = nestedBuilder.create<arith::ExtSIOp>(
+                nestedLoc, targetElementType, args[0]);
+            nestedBuilder.create<linalg::YieldOp>(nestedLoc, casted);
+          })
+      .getResult(0);
+}
+
+static Value buildDescaleRows(OpBuilder &builder, Location loc, Value matrix,
+                      Value scales, RankedTensorType resultType) {
+        auto elementType = resultType.getElementType();
+        Value init = buildZeroTensorLike(builder, loc, matrix, resultType);
+        return builder
+          .create<linalg::GenericOp>(
+            loc, TypeRange{resultType}, ValueRange{matrix, scales}, ValueRange{init},
+            SmallVector<AffineMap>{
+              AffineMap::getMultiDimIdentityMap(2, builder.getContext()),
+              AffineMap::get(2, 0, {builder.getAffineDimExpr(0)},
+                     builder.getContext()),
+              AffineMap::getMultiDimIdentityMap(2, builder.getContext())},
+            SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
+                             utils::IteratorType::parallel},
+            [elementType](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
+              Value scaleVal = args[1];
+              if (scaleVal.getType() != elementType) {
+                scaleVal = nestedBuilder.create<arith::ExtSIOp>(nestedLoc, elementType, scaleVal).getResult();
+              }
+              Value scaled = llvm::isa<FloatType>(elementType)
+                                 ? nestedBuilder.create<arith::DivFOp>(nestedLoc, args[0], scaleVal).getResult()
+                                 : (llvm::cast<IntegerType>(elementType).isUnsigned()
+                                        ? nestedBuilder.create<arith::DivUIOp>(nestedLoc, args[0], scaleVal).getResult()
+                                        : nestedBuilder.create<arith::DivSIOp>(nestedLoc, args[0], scaleVal).getResult());
+            nestedBuilder.create<linalg::YieldOp>(nestedLoc, scaled);
+            })
+          .getResult(0);
+      }
+
+      static Value buildDescaleCols(OpBuilder &builder, Location loc, Value matrix,
+                      Value scales, RankedTensorType resultType) {
+        auto elementType = resultType.getElementType();
+        Value init = buildZeroTensorLike(builder, loc, matrix, resultType);
+        return builder
+          .create<linalg::GenericOp>(
+            loc, TypeRange{resultType}, ValueRange{matrix, scales}, ValueRange{init},
+            SmallVector<AffineMap>{
+              AffineMap::getMultiDimIdentityMap(2, builder.getContext()),
+              AffineMap::get(2, 0, {builder.getAffineDimExpr(1)},
+                     builder.getContext()),
+              AffineMap::getMultiDimIdentityMap(2, builder.getContext())},
+            SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
+                             utils::IteratorType::parallel},
+            [elementType](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
+              Value scaleVal = args[1];
+              if (scaleVal.getType() != elementType) {
+                scaleVal = nestedBuilder.create<arith::ExtSIOp>(nestedLoc, elementType, scaleVal).getResult();
+              }
+              Value scaled = llvm::isa<FloatType>(elementType)
+                                 ? nestedBuilder.create<arith::DivFOp>(nestedLoc, args[0], scaleVal).getResult()
+                                 : (llvm::cast<IntegerType>(elementType).isUnsigned()
+                                        ? nestedBuilder.create<arith::DivUIOp>(nestedLoc, args[0], scaleVal).getResult()
+                                        : nestedBuilder.create<arith::DivSIOp>(nestedLoc, args[0], scaleVal).getResult());
+            nestedBuilder.create<linalg::YieldOp>(nestedLoc, scaled);
+            })
+          .getResult(0);
+      }
+
 // Elementwise add for rank-2 tensors with identical shapes.
 static Value buildElementwiseAdd(OpBuilder &builder, Location loc, Value lhs,
                  Value rhs, RankedTensorType resultType) {
   auto elementType = resultType.getElementType();
-  auto zeroAttr = builder.getFloatAttr(elementType, 0.0);
-  Value init = builder.create<arith::ConstantOp>(
-    loc, resultType, DenseElementsAttr::get(resultType, zeroAttr));
+  Value init = buildZeroTensorLike(builder, loc, lhs, resultType);
   return builder
     .create<linalg::GenericOp>(
       loc, TypeRange{resultType}, ValueRange{lhs, rhs}, ValueRange{init},
@@ -257,20 +574,19 @@ static Value buildElementwiseAdd(OpBuilder &builder, Location loc, Value lhs,
         AffineMap::getMultiDimIdentityMap(2, builder.getContext())},
       SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
                        utils::IteratorType::parallel},
-      [](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
-      Value sum = nestedBuilder.create<arith::AddFOp>(nestedLoc, args[0],
-                              args[1]);
+      [elementType](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
+      Value sum = llvm::isa<FloatType>(elementType)
+                      ? nestedBuilder.create<arith::AddFOp>(nestedLoc, args[0], args[1]).getResult()
+                      : nestedBuilder.create<arith::AddIOp>(nestedLoc, args[0], args[1]).getResult();
       nestedBuilder.create<linalg::YieldOp>(nestedLoc, sum);
       })
     .getResult(0);
 }
 
 static Value buildElementwiseSub(OpBuilder &builder, Location loc, Value lhs,
-                 Value rhs, RankedTensorType resultType) {
+                                 Value rhs, RankedTensorType resultType) {
   auto elementType = resultType.getElementType();
-  auto zeroAttr = builder.getFloatAttr(elementType, 0.0);
-  Value init = builder.create<arith::ConstantOp>(
-    loc, resultType, DenseElementsAttr::get(resultType, zeroAttr));
+  Value init = buildZeroTensorLike(builder, loc, lhs, resultType);
   return builder
     .create<linalg::GenericOp>(
       loc, TypeRange{resultType}, ValueRange{lhs, rhs}, ValueRange{init},
@@ -280,12 +596,99 @@ static Value buildElementwiseSub(OpBuilder &builder, Location loc, Value lhs,
         AffineMap::getMultiDimIdentityMap(2, builder.getContext())},
       SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
                        utils::IteratorType::parallel},
-      [](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
-      Value diff = nestedBuilder.create<arith::SubFOp>(nestedLoc, args[0],
-                              args[1]);
+      [elementType](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
+      Value diff = llvm::isa<FloatType>(elementType)
+                       ? nestedBuilder.create<arith::SubFOp>(nestedLoc, args[0], args[1]).getResult()
+                       : nestedBuilder.create<arith::SubIOp>(nestedLoc, args[0], args[1]).getResult();
       nestedBuilder.create<linalg::YieldOp>(nestedLoc, diff);
       })
     .getResult(0);
+}
+
+// Applies a deterministic synthetic fault to a rank-2 tensor by adding a
+// pattern matrix scaled by |delta| elementwise.
+static Value applyAByzFTFault(OpBuilder &builder, Location loc, Value tensor,
+                              int delta, StringRef pattern) {
+  auto ty = llvm::dyn_cast<RankedTensorType>(tensor.getType());
+  if (!ty || ty.getRank() != 2) return tensor;
+  Type elementType = ty.getElementType();
+  bool isFloat = llvm::isa<FloatType>(elementType);
+  bool isInt = llvm::isa<IntegerType>(elementType);
+  if (!isFloat && !isInt) return tensor;
+
+  Value c0 = builder.create<arith::ConstantIndexOp>(loc, 0);
+  Value c1 = builder.create<arith::ConstantIndexOp>(loc, 1);
+  Value c2 = builder.create<arith::ConstantIndexOp>(loc, 2);
+  SmallVector<Value, 2> dynSizes;
+  if (ty.isDynamicDim(0)) {
+    dynSizes.push_back(builder.create<tensor::DimOp>(loc, tensor, c0).getResult());
+  }
+  if (ty.isDynamicDim(1)) {
+    dynSizes.push_back(builder.create<tensor::DimOp>(loc, tensor, c1).getResult());
+  }
+  Value empty =
+      builder.create<tensor::EmptyOp>(loc, TypeRange{ty}, ValueRange{dynSizes}).getResult();
+
+  Value zeroVal;
+  Value deltaVal;
+  Value minusDeltaVal;
+  if (isFloat) {
+    auto fTy = llvm::cast<FloatType>(elementType);
+    zeroVal = builder.create<arith::ConstantFloatOp>(loc, APFloat(0.0f), fTy).getResult();
+    Value deltaI32 = builder.create<arith::ConstantIntOp>(loc, delta, 32).getResult();
+    deltaVal = builder.create<arith::SIToFPOp>(loc, fTy, deltaI32).getResult();
+    minusDeltaVal = builder.create<arith::NegFOp>(loc, deltaVal).getResult();
+  } else {
+    auto iTy = llvm::cast<IntegerType>(elementType);
+    Value deltaI32 = builder.create<arith::ConstantIntOp>(loc, delta, 32).getResult();
+    Value zeroI32 = builder.create<arith::ConstantIntOp>(loc, 0, 32).getResult();
+    if (iTy.getWidth() == 32) {
+      zeroVal = zeroI32;
+      deltaVal = deltaI32;
+    } else {
+      zeroVal = builder.create<arith::TruncIOp>(loc, iTy, zeroI32).getResult();
+      deltaVal = builder.create<arith::TruncIOp>(loc, iTy, deltaI32).getResult();
+    }
+    minusDeltaVal = builder.create<arith::SubIOp>(loc, zeroVal, deltaVal).getResult();
+  }
+
+  Value init = builder.create<linalg::FillOp>(loc, ValueRange{zeroVal}, ValueRange{empty}).getResult(0);
+  return builder
+      .create<linalg::GenericOp>(
+          loc, TypeRange{ty}, ValueRange{tensor}, ValueRange{init},
+          SmallVector<AffineMap>{
+              AffineMap::getMultiDimIdentityMap(2, builder.getContext()),
+              AffineMap::getMultiDimIdentityMap(2, builder.getContext())},
+          SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
+                                           utils::IteratorType::parallel},
+          [&](OpBuilder &nb, Location nloc, ValueRange args) {
+            Value i = nb.create<linalg::IndexOp>(nloc, 0).getResult();
+            Value j = nb.create<linalg::IndexOp>(nloc, 1).getResult();
+            Value fault = zeroVal;
+            if (pattern == "single_point") {
+              Value hitI = nb.create<arith::CmpIOp>(nloc, arith::CmpIPredicate::eq, i, c0).getResult();
+              Value hitJ = nb.create<arith::CmpIOp>(nloc, arith::CmpIPredicate::eq, j, c0).getResult();
+              Value hit = nb.create<arith::AndIOp>(nloc, hitI, hitJ).getResult();
+              fault = nb.create<arith::SelectOp>(nloc, hit, deltaVal, zeroVal).getResult();
+            } else if (pattern == "trivial") {
+              Value inI = nb.create<arith::CmpIOp>(nloc, arith::CmpIPredicate::ult, i, c2).getResult();
+              Value inJ = nb.create<arith::CmpIOp>(nloc, arith::CmpIPredicate::ult, j, c2).getResult();
+              Value inBlk = nb.create<arith::AndIOp>(nloc, inI, inJ).getResult();
+              Value im = nb.create<arith::RemUIOp>(nloc, i, c2).getResult();
+              Value jm = nb.create<arith::RemUIOp>(nloc, j, c2).getResult();
+              Value diag = nb.create<arith::CmpIOp>(nloc, arith::CmpIPredicate::eq, im, jm).getResult();
+              Value sign = nb.create<arith::SelectOp>(nloc, diag, deltaVal, minusDeltaVal).getResult();
+              fault = nb.create<arith::SelectOp>(nloc, inBlk, sign, zeroVal).getResult();
+            } else {
+              Value im = nb.create<arith::RemUIOp>(nloc, i, c2).getResult();
+              Value isEven = nb.create<arith::CmpIOp>(nloc, arith::CmpIPredicate::eq, im, c0).getResult();
+              fault = nb.create<arith::SelectOp>(nloc, isEven, deltaVal, minusDeltaVal).getResult();
+            }
+            Value out = isFloat ? nb.create<arith::AddFOp>(nloc, args[0], fault).getResult()
+                                : nb.create<arith::AddIOp>(nloc, args[0], fault).getResult();
+            nb.create<linalg::YieldOp>(nloc, out);
+          })
+      .getResult(0);
 }
 
 // Builds a row-checksum tensor: tensor<Mx1> = input[MxK] * ones[Kx1].
@@ -348,8 +751,8 @@ static Value buildDynamicRowvecMulMat(OpBuilder &builder, Location loc, Value rv
                                             ReassociationIndices{{0, 1}});
   Value empty2d =
       builder.create<tensor::EmptyOp>(loc, out2dType, ValueRange{n});
-  Value zero = builder.create<arith::ConstantFloatOp>(
-      loc, APFloat(0.0f), llvm::cast<FloatType>(elemType));
+  Value zero = builder.create<arith::ConstantOp>(
+      loc, elemType, builder.getZeroAttr(elemType));
   Value init2d =
       builder.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{empty2d})
           .getResult(0);
@@ -376,8 +779,8 @@ static Value buildDynamicMatMulColvec(OpBuilder &builder, Location loc, Value ma
                                             ReassociationIndices{{0, 1}});
   Value empty2d =
       builder.create<tensor::EmptyOp>(loc, out2dType, ValueRange{m});
-  Value zero = builder.create<arith::ConstantFloatOp>(
-      loc, APFloat(0.0f), llvm::cast<FloatType>(elemType));
+  Value zero = builder.create<arith::ConstantOp>(
+      loc, elemType, builder.getZeroAttr(elemType));
   Value init2d =
       builder.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{empty2d})
           .getResult(0);
@@ -388,6 +791,54 @@ static Value buildDynamicMatMulColvec(OpBuilder &builder, Location loc, Value ma
   return builder.create<tensor::CollapseShapeOp>(loc, out1dType, res2d,
                                                   ReassociationIndices{{0, 1}})
       .getResult();
+}
+
+// Converts a rank-2 tensor to tensor<?x?xf32> (shape-dynamic). Supports f32
+// and integer element types.
+static Value convertMatrixToDynamicF32(OpBuilder &builder, Location loc,
+                                       Value matrix) {
+  auto matrixType = llvm::dyn_cast<RankedTensorType>(matrix.getType());
+  if (!matrixType || matrixType.getRank() != 2)
+    return {};
+
+  auto outType = RankedTensorType::get(
+      {ShapedType::kDynamic, ShapedType::kDynamic}, builder.getF32Type());
+  Value c0 = builder.create<arith::ConstantIndexOp>(loc, 0);
+  Value c1 = builder.create<arith::ConstantIndexOp>(loc, 1);
+  Value m = builder.create<tensor::DimOp>(loc, matrix, c0);
+  Value n = builder.create<tensor::DimOp>(loc, matrix, c1);
+
+  if (matrixType.getElementType().isF32()) {
+    if (matrixType == outType)
+      return matrix;
+    return builder.create<tensor::CastOp>(loc, outType, matrix).getResult();
+  }
+
+  if (!llvm::isa<IntegerType>(matrixType.getElementType()))
+    return {};
+
+  Value empty =
+      builder.create<tensor::EmptyOp>(loc, TypeRange{outType}, ValueRange{m, n})
+          .getResult();
+  Value zero = builder.create<arith::ConstantOp>(
+      loc, builder.getF32Type(), builder.getF32FloatAttr(0.0f));
+  Value init =
+      builder.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{empty})
+          .getResult(0);
+  return builder
+      .create<linalg::GenericOp>(
+          loc, TypeRange{outType}, ValueRange{matrix}, ValueRange{init},
+          SmallVector<AffineMap>{
+              AffineMap::getMultiDimIdentityMap(2, builder.getContext()),
+              AffineMap::getMultiDimIdentityMap(2, builder.getContext())},
+          SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
+                                           utils::IteratorType::parallel},
+          [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
+            Value asF32 = nestedBuilder.create<arith::SIToFPOp>(
+                nestedLoc, nestedBuilder.getF32Type(), args[0]);
+            nestedBuilder.create<linalg::YieldOp>(nestedLoc, asF32);
+          })
+      .getResult(0);
 }
 
 struct AByzFTPass : public PassWrapper<AByzFTPass, OperationPass<ModuleOp>> {
@@ -571,7 +1022,7 @@ module {
 module {
   func.func @sample_row_scales(%mat: tensor<?x?xf32>) -> tensor<?xf32> {
     %c0 = arith.constant 0 : index
-    %c8 = arith.constant 8 : index
+    %c3 = arith.constant 3 : index
     %m = tensor.dim %mat, %c0 : tensor<?x?xf32>
     %empty = tensor.empty(%m) : tensor<?xf32>
     %init = arith.constant 0.0 : f32
@@ -582,37 +1033,21 @@ module {
     } outs(%filled : tensor<?xf32>) {
     ^bb0(%out: f32):
       %idx = linalg.index 0 : index
-      %mod = arith.remui %idx, %c8 : index
+      %mod = arith.remui %idx, %c3 : index
       %c0_cmp = arith.constant 0 : index
       %is0 = arith.cmpi eq, %mod, %c0_cmp : index
-      %v0 = arith.constant -8.0 : f32
+      %v0 = arith.constant 1.0 : f32
       %c1_cmp = arith.constant 1 : index
       %is1 = arith.cmpi eq, %mod, %c1_cmp : index
-      %v1 = arith.constant -4.0 : f32
+      %v1 = arith.constant 2.0 : f32
       %c2_cmp = arith.constant 2 : index
       %is2 = arith.cmpi eq, %mod, %c2_cmp : index
-      %v2 = arith.constant -2.0 : f32
-      %c3_cmp = arith.constant 3 : index
-      %is3 = arith.cmpi eq, %mod, %c3_cmp : index
-      %v3 = arith.constant -0.5 : f32
-      %c4_cmp = arith.constant 4 : index
-      %is4 = arith.cmpi eq, %mod, %c4_cmp : index
-      %v4 = arith.constant 0.5 : f32
-      %c5_cmp = arith.constant 5 : index
-      %is5 = arith.cmpi eq, %mod, %c5_cmp : index
-      %v5 = arith.constant 2.0 : f32
-      %c6_cmp = arith.constant 6 : index
-      %is6 = arith.cmpi eq, %mod, %c6_cmp : index
-      %v6 = arith.constant 4.0 : f32
-      %v7 = arith.constant 8.0 : f32
-      %sel0 = arith.select %is0, %v0, %v7 : f32
+      %v2 = arith.constant 4.0 : f32
+      %v3 = arith.constant 1.0 : f32
+      %sel0 = arith.select %is0, %v0, %v3 : f32
       %sel1 = arith.select %is1, %v1, %sel0 : f32
       %sel2 = arith.select %is2, %v2, %sel1 : f32
-      %sel3 = arith.select %is3, %v3, %sel2 : f32
-      %sel4 = arith.select %is4, %v4, %sel3 : f32
-      %sel5 = arith.select %is5, %v5, %sel4 : f32
-      %sel6 = arith.select %is6, %v6, %sel5 : f32
-      linalg.yield %sel6 : f32
+      linalg.yield %sel2 : f32
     } -> tensor<?xf32>
     return %res : tensor<?xf32>
   }
@@ -622,7 +1057,7 @@ module {
 module {
   func.func @sample_col_scales(%mat: tensor<?x?xf32>) -> tensor<?xf32> {
     %c1 = arith.constant 1 : index
-    %c8 = arith.constant 8 : index
+    %c3 = arith.constant 3 : index
     %n = tensor.dim %mat, %c1 : tensor<?x?xf32>
     %empty = tensor.empty(%n) : tensor<?xf32>
     %init = arith.constant 0.0 : f32
@@ -633,37 +1068,21 @@ module {
     } outs(%filled : tensor<?xf32>) {
     ^bb0(%out: f32):
       %idx = linalg.index 0 : index
-      %mod = arith.remui %idx, %c8 : index
+      %mod = arith.remui %idx, %c3 : index
       %c0_cmp = arith.constant 0 : index
       %is0 = arith.cmpi eq, %mod, %c0_cmp : index
-      %v0 = arith.constant -8.0 : f32
+      %v0 = arith.constant 1.0 : f32
       %c1_cmp = arith.constant 1 : index
       %is1 = arith.cmpi eq, %mod, %c1_cmp : index
-      %v1 = arith.constant -4.0 : f32
+      %v1 = arith.constant 2.0 : f32
       %c2_cmp = arith.constant 2 : index
       %is2 = arith.cmpi eq, %mod, %c2_cmp : index
-      %v2 = arith.constant -2.0 : f32
-      %c3_cmp = arith.constant 3 : index
-      %is3 = arith.cmpi eq, %mod, %c3_cmp : index
-      %v3 = arith.constant -0.5 : f32
-      %c4_cmp = arith.constant 4 : index
-      %is4 = arith.cmpi eq, %mod, %c4_cmp : index
-      %v4 = arith.constant 0.5 : f32
-      %c5_cmp = arith.constant 5 : index
-      %is5 = arith.cmpi eq, %mod, %c5_cmp : index
-      %v5 = arith.constant 2.0 : f32
-      %c6_cmp = arith.constant 6 : index
-      %is6 = arith.cmpi eq, %mod, %c6_cmp : index
-      %v6 = arith.constant 4.0 : f32
-      %v7 = arith.constant 8.0 : f32
-      %sel0 = arith.select %is0, %v0, %v7 : f32
+      %v2 = arith.constant 4.0 : f32
+      %v3 = arith.constant 1.0 : f32
+      %sel0 = arith.select %is0, %v0, %v3 : f32
       %sel1 = arith.select %is1, %v1, %sel0 : f32
       %sel2 = arith.select %is2, %v2, %sel1 : f32
-      %sel3 = arith.select %is3, %v3, %sel2 : f32
-      %sel4 = arith.select %is4, %v4, %sel3 : f32
-      %sel5 = arith.select %is5, %v5, %sel4 : f32
-      %sel6 = arith.select %is6, %v6, %sel5 : f32
-      linalg.yield %sel6 : f32
+      linalg.yield %sel2 : f32
     } -> tensor<?xf32>
     return %res : tensor<?xf32>
   }
@@ -805,7 +1224,7 @@ module {
 module {
   func.func @sample_row_scales(%mat: tensor<?x?xf32>) -> tensor<?xf32> {
     %c0 = arith.constant 0 : index
-    %c8 = arith.constant 8 : index
+    %c3 = arith.constant 3 : index
     %m = tensor.dim %mat, %c0 : tensor<?x?xf32>
     %empty = tensor.empty(%m) : tensor<?xf32>
     %init = arith.constant 0.0 : f32
@@ -816,37 +1235,21 @@ module {
     } outs(%filled : tensor<?xf32>) {
     ^bb0(%out: f32):
       %idx = linalg.index 0 : index
-      %mod = arith.remui %idx, %c8 : index
+      %mod = arith.remui %idx, %c3 : index
       %c0_cmp = arith.constant 0 : index
       %is0 = arith.cmpi eq, %mod, %c0_cmp : index
-      %v0 = arith.constant -8.0 : f32
+      %v0 = arith.constant 1.0 : f32
       %c1_cmp = arith.constant 1 : index
       %is1 = arith.cmpi eq, %mod, %c1_cmp : index
-      %v1 = arith.constant -4.0 : f32
+      %v1 = arith.constant 2.0 : f32
       %c2_cmp = arith.constant 2 : index
       %is2 = arith.cmpi eq, %mod, %c2_cmp : index
-      %v2 = arith.constant -2.0 : f32
-      %c3_cmp = arith.constant 3 : index
-      %is3 = arith.cmpi eq, %mod, %c3_cmp : index
-      %v3 = arith.constant -0.5 : f32
-      %c4_cmp = arith.constant 4 : index
-      %is4 = arith.cmpi eq, %mod, %c4_cmp : index
-      %v4 = arith.constant 0.5 : f32
-      %c5_cmp = arith.constant 5 : index
-      %is5 = arith.cmpi eq, %mod, %c5_cmp : index
-      %v5 = arith.constant 2.0 : f32
-      %c6_cmp = arith.constant 6 : index
-      %is6 = arith.cmpi eq, %mod, %c6_cmp : index
-      %v6 = arith.constant 4.0 : f32
-      %v7 = arith.constant 8.0 : f32
-      %sel0 = arith.select %is0, %v0, %v7 : f32
+      %v2 = arith.constant 4.0 : f32
+      %v3 = arith.constant 1.0 : f32
+      %sel0 = arith.select %is0, %v0, %v3 : f32
       %sel1 = arith.select %is1, %v1, %sel0 : f32
       %sel2 = arith.select %is2, %v2, %sel1 : f32
-      %sel3 = arith.select %is3, %v3, %sel2 : f32
-      %sel4 = arith.select %is4, %v4, %sel3 : f32
-      %sel5 = arith.select %is5, %v5, %sel4 : f32
-      %sel6 = arith.select %is6, %v6, %sel5 : f32
-      linalg.yield %sel6 : f32
+      linalg.yield %sel2 : f32
     } -> tensor<?xf32>
     return %res : tensor<?xf32>
   }
@@ -856,7 +1259,7 @@ module {
 module {
   func.func @sample_col_scales(%mat: tensor<?x?xf32>) -> tensor<?xf32> {
     %c1 = arith.constant 1 : index
-    %c8 = arith.constant 8 : index
+    %c3 = arith.constant 3 : index
     %n = tensor.dim %mat, %c1 : tensor<?x?xf32>
     %empty = tensor.empty(%n) : tensor<?xf32>
     %init = arith.constant 0.0 : f32
@@ -867,37 +1270,21 @@ module {
     } outs(%filled : tensor<?xf32>) {
     ^bb0(%out: f32):
       %idx = linalg.index 0 : index
-      %mod = arith.remui %idx, %c8 : index
+      %mod = arith.remui %idx, %c3 : index
       %c0_cmp = arith.constant 0 : index
       %is0 = arith.cmpi eq, %mod, %c0_cmp : index
-      %v0 = arith.constant -8.0 : f32
+      %v0 = arith.constant 1.0 : f32
       %c1_cmp = arith.constant 1 : index
       %is1 = arith.cmpi eq, %mod, %c1_cmp : index
-      %v1 = arith.constant -4.0 : f32
+      %v1 = arith.constant 2.0 : f32
       %c2_cmp = arith.constant 2 : index
       %is2 = arith.cmpi eq, %mod, %c2_cmp : index
-      %v2 = arith.constant -2.0 : f32
-      %c3_cmp = arith.constant 3 : index
-      %is3 = arith.cmpi eq, %mod, %c3_cmp : index
-      %v3 = arith.constant -0.5 : f32
-      %c4_cmp = arith.constant 4 : index
-      %is4 = arith.cmpi eq, %mod, %c4_cmp : index
-      %v4 = arith.constant 0.5 : f32
-      %c5_cmp = arith.constant 5 : index
-      %is5 = arith.cmpi eq, %mod, %c5_cmp : index
-      %v5 = arith.constant 2.0 : f32
-      %c6_cmp = arith.constant 6 : index
-      %is6 = arith.cmpi eq, %mod, %c6_cmp : index
-      %v6 = arith.constant 4.0 : f32
-      %v7 = arith.constant 8.0 : f32
-      %sel0 = arith.select %is0, %v0, %v7 : f32
+      %v2 = arith.constant 4.0 : f32
+      %v3 = arith.constant 1.0 : f32
+      %sel0 = arith.select %is0, %v0, %v3 : f32
       %sel1 = arith.select %is1, %v1, %sel0 : f32
       %sel2 = arith.select %is2, %v2, %sel1 : f32
-      %sel3 = arith.select %is3, %v3, %sel2 : f32
-      %sel4 = arith.select %is4, %v4, %sel3 : f32
-      %sel5 = arith.select %is5, %v5, %sel4 : f32
-      %sel6 = arith.select %is6, %v6, %sel5 : f32
-      linalg.yield %sel6 : f32
+      linalg.yield %sel2 : f32
     } -> tensor<?xf32>
     return %res : tensor<?xf32>
   }
@@ -1426,75 +1813,14 @@ module {
         return;
       targets.push_back(matmul);
     });
-    if (targets.empty() && logRowColDeltaFn) {
-      SmallVector<Operation *, 8> quantTargets;
-      module.walk([&](Operation *op) {
-        auto parentFunc = op->getParentOfType<func::FuncOp>();
-        if (isHelperFunction(parentFunc))
-          return;
-        StringRef name = op->getName().getStringRef();
-        if (name == "linalg.quantized_matmul" ||
-            name == "linalg.conv_2d_nhwc_hwcf_q" ||
-            name == "linalg.depthwise_conv_2d_nhwc_hwcm_q") {
-          quantTargets.push_back(op);
-        }
-      });
-      for (auto [index, op] : llvm::enumerate(quantTargets)) {
-        if (op->getNumResults() == 0)
-          continue;
-        auto outTy = llvm::dyn_cast<RankedTensorType>(op->getResult(0).getType());
-        if (!outTy || !outTy.getElementType().isInteger(32))
-          continue;
-        OpBuilder builder(op);
-        Location loc = op->getLoc();
-        Operation *dup = builder.clone(*op);
-        if (!dup || dup->getNumResults() == 0)
-          continue;
-
-        Value refOut = op->getResult(0);
-        Value dupOut = dup->getResult(0);
-        Block::iterator nextIt = std::next(Block::iterator(op));
-        OpBuilder bAfter(op->getBlock(), nextIt);
-
-        SmallVector<Value> idx;
-        idx.reserve(outTy.getRank());
-        for (int64_t i = 0; i < outTy.getRank(); ++i) {
-          idx.push_back(bAfter.create<arith::ConstantIndexOp>(loc, 0));
-        }
-
-        Value ref0 = bAfter.create<tensor::ExtractOp>(loc, refOut, idx);
-        Value dup0 = bAfter.create<tensor::ExtractOp>(loc, dupOut, idx);
-        if (abyzftInjectFault.getValue()) {
-          StringRef pattern = abyzftInjectFaultPattern.getValue();
-          int base = abyzftInjectFaultDelta.getValue();
-          Value delta = bAfter.create<arith::ConstantIntOp>(loc, base, 32);
-          // Use data-dependent magnitude instead of layer-index amplification.
-          auto one = bAfter.create<arith::ConstantIntOp>(loc, 1, 32);
-          auto zero = bAfter.create<arith::ConstantIntOp>(loc, 0, 32);
-          auto isNeg = bAfter.create<arith::CmpIOp>(
-              loc, arith::CmpIPredicate::slt, dup0, zero);
-          auto negDup = bAfter.create<arith::SubIOp>(loc, zero, dup0);
-          auto absDup =
-              bAfter.create<arith::SelectOp>(loc, isNeg, negDup, dup0);
-          auto mag = bAfter.create<arith::MaxSIOp>(loc, absDup, one);
-          delta = bAfter.create<arith::MulIOp>(loc, delta, mag);
-          if (pattern == "checkered") {
-            delta = bAfter.create<arith::SubIOp>(loc, zero, delta);
-          }
-          dup0 = bAfter.create<arith::AddIOp>(loc, dup0, delta);
-        }
-        Value refF = bAfter.create<arith::SIToFPOp>(loc, bAfter.getF32Type(), ref0);
-        Value dupF = bAfter.create<arith::SIToFPOp>(loc, bAfter.getF32Type(), dup0);
-        Value diff = bAfter.create<arith::SubFOp>(loc, refF, dupF);
-        Value delta = bAfter.create<math::AbsFOp>(loc, diff);
-        Value layerConst = bAfter.create<arith::ConstantOp>(
-            loc, bAfter.getF32Type(), bAfter.getF32FloatAttr((float)index));
-        bAfter.create<func::CallOp>(
-            loc, StringRef("abft_analysis.abft_log_rowcol_delta"), TypeRange{},
-            ValueRange{layerConst, delta, delta});
-      }
+    SmallVector<linalg::QuantizedMatmulOp> qTargets;
+    module.walk([&](linalg::QuantizedMatmulOp qmatmul) {
+      if (isHelperFunction(qmatmul->getParentOfType<func::FuncOp>()))
+        return;
+      qTargets.push_back(qmatmul);
+    });
+    if (targets.empty() && qTargets.empty())
       return;
-    }
 
     for (auto [matmulIndex, matmul] : llvm::enumerate(targets)) {
       OpBuilder builder(matmul);
@@ -1511,6 +1837,183 @@ module {
         matmul.emitError("Expected rank-2 tensor operands/results for AByzFT");
         signalPassFailure();
         return;
+      }
+
+      int64_t M = lhsType.getShape()[0];
+      int64_t K = lhsType.getShape()[1];
+      int64_t rhsK = rhsType.getShape()[0];
+      int64_t N = rhsType.getShape()[1];
+
+      // Integer matmuls use integer-valued scale sampling and integer math for
+      // scaling/descaling; the checksum/logging path still uses f32 views.
+      if (!llvm::isa<FloatType>(lhsType.getElementType()) ||
+          !llvm::isa<FloatType>(rhsType.getElementType()) ||
+          !llvm::isa<FloatType>(outType.getElementType())) {
+        if (!rowFn || !colFn || !vecMaxFn || !logRowColDeltaFn) {
+          matmul.emitError(
+              "Missing checksum/log helpers for integer AByzFT matmul");
+          signalPassFailure();
+          return;
+        }
+
+        Value c0 = builder.create<arith::ConstantIndexOp>(loc, 0);
+        Value c1 = builder.create<arith::ConstantIndexOp>(loc, 1);
+        Value lhsRows = builder.create<tensor::DimOp>(loc, lhs, c0);
+        Value rhsCols = builder.create<tensor::DimOp>(loc, rhs, c1);
+        bool useStaticIntegerVector = lhsType.hasStaticShape() &&
+                                      rhsType.hasStaticShape() &&
+                                      outType.hasStaticShape();
+        Value rowScaleVector;
+        Value colScaleVector;
+        if (useStaticIntegerVector) {
+          auto rowScaleValues = sampleIntScaleVector(matmul, M);
+          auto colScaleValues = sampleIntScaleVector(matmul, N);
+          auto rowVectorType = RankedTensorType::get({M}, lhsType.getElementType());
+          auto colVectorType = RankedTensorType::get({N}, rhsType.getElementType());
+          rowScaleVector = builder.create<arith::ConstantOp>(
+              loc, rowVectorType,
+              buildDenseIntTensorAttr(rowVectorType, rowScaleValues));
+          colScaleVector = builder.create<arith::ConstantOp>(
+              loc, colVectorType,
+              buildDenseIntTensorAttr(colVectorType, colScaleValues));
+        } else {
+          auto rowElementType = llvm::cast<IntegerType>(lhsType.getElementType());
+          auto colElementType = llvm::cast<IntegerType>(rhsType.getElementType());
+          rowScaleVector = buildFilledIntVectorConstant(
+              builder, loc, lhsRows, rowElementType, sampleIntScaleValue(matmul));
+          colScaleVector = buildFilledIntVectorConstant(
+              builder, loc, rhsCols, colElementType, sampleIntScaleValue(matmul));
+        }
+
+        Value lhsScaled =
+            buildScaleRows(builder, loc, lhs, rowScaleVector, lhsType);
+        Value rhsScaled =
+            buildScaleCols(builder, loc, rhs, colScaleVector, rhsType);
+        Value zeroInit = buildZeroTensorLike(builder, loc, outInit, outType);
+
+        matmul->setOperand(0, lhsScaled);
+        matmul->setOperand(1, rhsScaled);
+        matmul->setOperand(2, zeroInit);
+
+        builder.setInsertionPointAfter(matmul);
+        Value scaledMatmulResult = matmul.getResult(0);
+        if (abyzftInjectFault) {
+          scaledMatmulResult = applyAByzFTFault(builder, loc, scaledMatmulResult,
+                                                abyzftInjectFaultDelta,
+                                                abyzftInjectFaultPattern.getValue());
+          matmul.emitRemark() << "abyzft-int-matmul: injected "
+                              << abyzftInjectFaultPattern.getValue() << " fault";
+        }
+
+        // Cast scale vectors to output element type before descaling.
+        auto outElementType = outType.getElementType();
+        Value rowScaleVectorCasted =
+            castVectorToType(builder, loc, rowScaleVector, outElementType);
+        Value colScaleVectorCasted =
+            castVectorToType(builder, loc, colScaleVector, outElementType);
+
+        Value descaleRows = buildDescaleRows(builder, loc, scaledMatmulResult,
+                                             rowScaleVectorCasted, outType);
+        Value descaleCols = buildDescaleCols(builder, loc, descaleRows,
+                                             colScaleVectorCasted, outType);
+        Value matmulResult =
+            buildElementwiseAdd(builder, loc, descaleCols, outInit, outType);
+        Value compareMatrix =
+            buildElementwiseSub(builder, loc, matmulResult, outInit, outType);
+
+        Value lhsF = convertMatrixToDynamicF32(builder, loc, lhs);
+        Value rhsF = convertMatrixToDynamicF32(builder, loc, rhs);
+        Value compareMatrixF = convertMatrixToDynamicF32(builder, loc, compareMatrix);
+        if (!lhsF || !rhsF || !compareMatrixF) {
+          matmul.emitError("Failed to convert integer matmul tensors to f32");
+          signalPassFailure();
+          return;
+        }
+
+        Value lhsColChecksum = builder
+                                   .create<func::CallOp>(
+                                       loc, StringRef("column_checksum"),
+                                       TypeRange{colFn.getFunctionType().getResult(0)},
+                                       ValueRange{lhsF})
+                                   .getResult(0);
+        Value rhsRowChecksum = builder
+                                   .create<func::CallOp>(
+                                       loc, StringRef("row_checksum"),
+                                       TypeRange{rowFn.getFunctionType().getResult(0)},
+                                       ValueRange{rhsF})
+                                   .getResult(0);
+        Value expectedOutColChecksum =
+            buildDynamicRowvecMulMat(builder, loc, lhsColChecksum, rhsF);
+        Value expectedOutRowChecksum =
+            buildDynamicMatMulColvec(builder, loc, lhsF, rhsRowChecksum);
+
+        Value outRowChecksum = builder
+                                   .create<func::CallOp>(
+                                       loc, StringRef("row_checksum"),
+                                       TypeRange{rowFn.getFunctionType().getResult(0)},
+                                       ValueRange{compareMatrixF})
+                                   .getResult(0);
+        Value outColChecksum = builder
+                                   .create<func::CallOp>(
+                                       loc, StringRef("column_checksum"),
+                                       TypeRange{colFn.getFunctionType().getResult(0)},
+                                       ValueRange{compareMatrixF})
+                                   .getResult(0);
+
+        Value rowMaxDelta = builder
+                                .create<func::CallOp>(
+                                    loc, StringRef("vector_max_abs_diff"),
+                                    TypeRange{vecMaxFn.getFunctionType().getResult(0)},
+                                    ValueRange{expectedOutRowChecksum, outRowChecksum})
+                                .getResult(0);
+        Value colMaxDelta = builder
+                                .create<func::CallOp>(
+                                    loc, StringRef("vector_max_abs_diff"),
+                                    TypeRange{vecMaxFn.getFunctionType().getResult(0)},
+                                    ValueRange{expectedOutColChecksum, outColChecksum})
+                                .getResult(0);
+
+        Value rowExpMax = rowMaxDelta;
+        Value rowCalcMax = rowMaxDelta;
+        Value colExpMax = colMaxDelta;
+        Value colCalcMax = colMaxDelta;
+        if (vecMaxPairFn && !vecMaxPairFn.isExternal() && logRowColDebugFn) {
+          auto rowPair = builder.create<func::CallOp>(
+              loc, StringRef("vector_max_abs_diff_pair"),
+              TypeRange{vecMaxPairFn.getFunctionType().getResult(0),
+                        vecMaxPairFn.getFunctionType().getResult(1)},
+              ValueRange{expectedOutRowChecksum, outRowChecksum});
+          rowExpMax = rowPair.getResult(0);
+          rowCalcMax = rowPair.getResult(1);
+          auto colPair = builder.create<func::CallOp>(
+              loc, StringRef("vector_max_abs_diff_pair"),
+              TypeRange{vecMaxPairFn.getFunctionType().getResult(0),
+                        vecMaxPairFn.getFunctionType().getResult(1)},
+              ValueRange{expectedOutColChecksum, outColChecksum});
+          colExpMax = colPair.getResult(0);
+          colCalcMax = colPair.getResult(1);
+        }
+
+        Value indexConst = builder.create<arith::ConstantOp>(
+            loc, builder.getF32Type(),
+            builder.getF32FloatAttr(static_cast<float>(matmulIndex)));
+        builder.create<func::CallOp>(
+            loc, StringRef("abft_analysis.abft_log_rowcol_delta"), TypeRange{},
+            ValueRange{indexConst, rowMaxDelta, colMaxDelta});
+        if (logRowColDebugFn) {
+          builder.create<func::CallOp>(
+              loc, StringRef("abft_analysis.abft_log_rowcol_debug"), TypeRange{},
+              ValueRange{indexConst, rowExpMax, rowCalcMax, colExpMax,
+                         colCalcMax});
+        }
+
+        DominanceInfo dom(module);
+        matmul.getResult(0).replaceUsesWithIf(matmulResult, [&](OpOperand &use) {
+          Operation *user = use.getOwner();
+          return user != matmulResult.getDefiningOp() &&
+                 dom.properlyDominates(matmulResult.getDefiningOp(), user);
+        });
+        continue;
       }
 
       auto dyn2dTy = RankedTensorType::get(
@@ -1587,6 +2090,13 @@ module {
         Value scaledResultDyn = outType != dyn2dTy
                                     ? builder.create<tensor::CastOp>(loc, dyn2dTy, matmul.getResult(0)).getResult()
                                     : matmul.getResult(0);
+        if (abyzftInjectFault) {
+          scaledResultDyn = applyAByzFTFault(builder, loc, scaledResultDyn,
+                                             abyzftInjectFaultDelta,
+                                             abyzftInjectFaultPattern.getValue());
+          matmul.emitRemark() << "abyzft-float-dyn-matmul: injected "
+                              << abyzftInjectFaultPattern.getValue() << " fault";
+        }
         Value descaledDyn = builder
                                 .create<func::CallOp>(
                                     loc, StringRef("descale_matrix"),
@@ -1703,10 +2213,6 @@ module {
         continue;
       }
 
-      int64_t M = lhsType.getShape()[0];
-      int64_t K = lhsType.getShape()[1];
-      int64_t rhsK = rhsType.getShape()[0];
-      int64_t N = rhsType.getShape()[1];
       if (K != rhsK || outType.getShape()[0] != M || outType.getShape()[1] != N) {
         matmul.emitError("Matmul operand/result shapes are inconsistent");
         signalPassFailure();
@@ -1774,6 +2280,13 @@ module {
 
       builder.setInsertionPointAfter(matmul);
       Value scaledMatmulResult = matmul.getResult(0);
+      if (abyzftInjectFault) {
+        scaledMatmulResult = applyAByzFTFault(builder, loc, scaledMatmulResult,
+                                              abyzftInjectFaultDelta,
+                                              abyzftInjectFaultPattern.getValue());
+        matmul.emitRemark() << "abyzft-float-matmul: injected "
+                            << abyzftInjectFaultPattern.getValue() << " fault";
+      }
       Value descaleRows =
           buildScaleRows(builder, loc, scaledMatmulResult, invRowScale, outType);
       Value descaleCols =
@@ -1928,6 +2441,515 @@ module {
         return user != matmulResult.getDefiningOp() &&
                dom.properlyDominates(matmulResult.getDefiningOp(), user);
       });
+    }
+
+    // Quantized matmul coverage: keep ABFT's integer-exact checksum logic and
+    // add AByzFT scaling on top in high precision.
+    for (auto [qIndex, qmatmul] : llvm::enumerate(qTargets)) {
+      OpBuilder builder(qmatmul);
+      Location loc = qmatmul.getLoc();
+
+      Value lhs = qmatmul.getDpsInputOperand(0)->get();
+      Value rhs = qmatmul.getDpsInputOperand(1)->get();
+      Value lhsZp = qmatmul.getDpsInputOperand(2)->get();
+      Value rhsZp = qmatmul.getDpsInputOperand(3)->get();
+      Value outInit = qmatmul.getDpsInitOperand(0)->get();
+      auto lhsType = llvm::dyn_cast<RankedTensorType>(lhs.getType());
+      auto rhsType = llvm::dyn_cast<RankedTensorType>(rhs.getType());
+      auto outType = llvm::dyn_cast<RankedTensorType>(outInit.getType());
+      if (!lhsType || !rhsType || !outType || lhsType.getRank() != 2 ||
+          rhsType.getRank() != 2 || outType.getRank() != 2) {
+        qmatmul.emitError(
+            "Expected rank-2 tensor operands/results for quantized AByzFT");
+        signalPassFailure();
+        return;
+      }
+
+      Value lhsF = convertMatrixToDynamicF32(builder, loc, lhs);
+      Value rhsF = convertMatrixToDynamicF32(builder, loc, rhs);
+      if (!lhsF || !rhsF) {
+        qmatmul.emitError("Failed to convert quantized tensors to f32");
+        signalPassFailure();
+        return;
+      }
+
+      if (!logRowColDeltaFn || !sampleRowFn || !sampleColFn) {
+        qmatmul.emitError("Missing checksum/log helpers for quantized AByzFT");
+        signalPassFailure();
+        return;
+      }
+
+      Value c0 = builder.create<arith::ConstantIndexOp>(loc, 0);
+      Value c1 = builder.create<arith::ConstantIndexOp>(loc, 1);
+      Value z64 = builder.create<arith::ConstantIntOp>(loc, 0, 64);
+
+      auto dyn2dI64 = RankedTensorType::get(
+          {ShapedType::kDynamic, ShapedType::kDynamic}, builder.getI64Type());
+      auto vecDynI64 = RankedTensorType::get(
+          {ShapedType::kDynamic}, builder.getI64Type());
+      auto scalarI64Ty = RankedTensorType::get({}, builder.getI64Type());
+
+      auto castToI64 = [&](Value v) -> Value {
+        auto ty = llvm::dyn_cast<RankedTensorType>(v.getType());
+        if (!ty || ty.getRank() != 2 || !llvm::isa<IntegerType>(ty.getElementType()))
+          return Value();
+        Value m = builder.create<tensor::DimOp>(loc, v, c0);
+        Value n = builder.create<tensor::DimOp>(loc, v, c1);
+        Value empty = builder
+                          .create<tensor::EmptyOp>(loc, TypeRange{dyn2dI64},
+                                                   ValueRange{m, n})
+                          .getResult();
+        Value init = builder
+                         .create<linalg::FillOp>(loc, ValueRange{z64},
+                                                 ValueRange{empty})
+                         .getResult(0);
+        return builder
+            .create<linalg::GenericOp>(
+                loc, TypeRange{dyn2dI64}, ValueRange{v}, ValueRange{init},
+                SmallVector<AffineMap>{
+                    AffineMap::getMultiDimIdentityMap(2, builder.getContext()),
+                    AffineMap::getMultiDimIdentityMap(2, builder.getContext())},
+                SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
+                                                 utils::IteratorType::parallel},
+                [&](OpBuilder &nb, Location nloc, ValueRange args) {
+                  Value ex = nb
+                                 .create<arith::ExtSIOp>(nloc, nb.getI64Type(),
+                                                         args[0])
+                                 .getResult();
+                  nb.create<linalg::YieldOp>(nloc, ex);
+                })
+            .getResult(0);
+      };
+
+      auto extractI64Scalar = [&](Value v) -> Value {
+        if (auto ty = llvm::dyn_cast<RankedTensorType>(v.getType())) {
+          if (ty.getRank() == 0) {
+            Value s = builder.create<tensor::ExtractOp>(loc, v).getResult();
+            if (s.getType().isInteger(64))
+              return s;
+            return builder.create<arith::ExtSIOp>(loc, builder.getI64Type(), s)
+                .getResult();
+          }
+        }
+        if (v.getType().isInteger(64))
+          return v;
+        return builder.create<arith::ExtSIOp>(loc, builder.getI64Type(), v)
+            .getResult();
+      };
+
+      auto subScalarFromMatI64 = [&](Value mat, Value scalarI64) -> Value {
+        Value m = builder.create<tensor::DimOp>(loc, mat, c0);
+        Value n = builder.create<tensor::DimOp>(loc, mat, c1);
+        Value empty = builder
+                          .create<tensor::EmptyOp>(loc, TypeRange{dyn2dI64},
+                                                   ValueRange{m, n})
+                          .getResult();
+        Value init = builder
+                         .create<linalg::FillOp>(loc, ValueRange{z64},
+                                                 ValueRange{empty})
+                         .getResult(0);
+        return builder
+            .create<linalg::GenericOp>(
+                loc, TypeRange{dyn2dI64}, ValueRange{mat, scalarI64},
+                ValueRange{init},
+                SmallVector<AffineMap>{
+                    AffineMap::getMultiDimIdentityMap(2, builder.getContext()),
+                    AffineMap::get(2, 0, {}, builder.getContext()),
+                    AffineMap::getMultiDimIdentityMap(2, builder.getContext())},
+                SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
+                                                 utils::IteratorType::parallel},
+                [&](OpBuilder &nb, Location nloc, ValueRange args) {
+                  Value d =
+                      nb.create<arith::SubIOp>(nloc, args[0], args[1]).getResult();
+                  nb.create<linalg::YieldOp>(nloc, d);
+                })
+            .getResult(0);
+      };
+
+      auto makeChecksumI64 = [&](Value in, int64_t dimToReduce) -> Value {
+        Value outLen = (dimToReduce == 0)
+                           ? builder.create<tensor::DimOp>(loc, in, c1).getResult()
+                           : builder.create<tensor::DimOp>(loc, in, c0).getResult();
+        Value empty = builder
+                          .create<tensor::EmptyOp>(loc, TypeRange{vecDynI64},
+                                                   ValueRange{outLen})
+                          .getResult();
+        Value init = builder
+                         .create<linalg::FillOp>(loc, ValueRange{z64},
+                                                 ValueRange{empty})
+                         .getResult(0);
+        return builder
+            .create<linalg::ReduceOp>(
+                loc, ValueRange{in}, ValueRange{init},
+                ArrayRef<int64_t>{dimToReduce},
+                [&](OpBuilder &nb, Location nloc, ValueRange args) {
+                  Value sum =
+                      nb.create<arith::AddIOp>(nloc, args[0], args[1]).getResult();
+                  nb.create<linalg::YieldOp>(nloc, sum);
+                })
+            .getResult(0);
+      };
+
+      auto matMulColvecI64 = [&](Value mat, Value vec) -> Value {
+        Value m = builder.create<tensor::DimOp>(loc, mat, c0);
+        Value empty = builder
+                          .create<tensor::EmptyOp>(loc, TypeRange{vecDynI64},
+                                                   ValueRange{m})
+                          .getResult();
+        Value init = builder
+                         .create<linalg::FillOp>(loc, ValueRange{z64},
+                                                 ValueRange{empty})
+                         .getResult(0);
+        return builder
+            .create<linalg::GenericOp>(
+                loc, TypeRange{vecDynI64}, ValueRange{mat, vec}, ValueRange{init},
+                SmallVector<AffineMap>{
+                    AffineMap::get(2, 0,
+                                   {getAffineDimExpr(0, builder.getContext()),
+                                    getAffineDimExpr(1, builder.getContext())},
+                                   builder.getContext()),
+                    AffineMap::get(2, 0, {getAffineDimExpr(1, builder.getContext())},
+                                   builder.getContext()),
+                    AffineMap::get(2, 0, {getAffineDimExpr(0, builder.getContext())},
+                                   builder.getContext())},
+                SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
+                                                 utils::IteratorType::reduction},
+                [&](OpBuilder &nb, Location nloc, ValueRange args) {
+                  Value p =
+                      nb.create<arith::MulIOp>(nloc, args[0], args[1]).getResult();
+                  Value s =
+                      nb.create<arith::AddIOp>(nloc, args[2], p).getResult();
+                  nb.create<linalg::YieldOp>(nloc, s);
+                })
+            .getResult(0);
+      };
+
+      auto rowvecMulMatI64 = [&](Value rowv, Value mat) -> Value {
+        Value n = builder.create<tensor::DimOp>(loc, mat, c1);
+        Value empty = builder
+                          .create<tensor::EmptyOp>(loc, TypeRange{vecDynI64},
+                                                   ValueRange{n})
+                          .getResult();
+        Value init = builder
+                         .create<linalg::FillOp>(loc, ValueRange{z64},
+                                                 ValueRange{empty})
+                         .getResult(0);
+        return builder
+            .create<linalg::GenericOp>(
+                loc, TypeRange{vecDynI64}, ValueRange{rowv, mat}, ValueRange{init},
+                SmallVector<AffineMap>{
+                    AffineMap::get(2, 0, {getAffineDimExpr(1, builder.getContext())},
+                                   builder.getContext()),
+                    AffineMap::get(2, 0,
+                                   {getAffineDimExpr(1, builder.getContext()),
+                                    getAffineDimExpr(0, builder.getContext())},
+                                   builder.getContext()),
+                    AffineMap::get(2, 0, {getAffineDimExpr(0, builder.getContext())},
+                                   builder.getContext())},
+                SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
+                                                 utils::IteratorType::reduction},
+                [&](OpBuilder &nb, Location nloc, ValueRange args) {
+                  Value p =
+                      nb.create<arith::MulIOp>(nloc, args[0], args[1]).getResult();
+                  Value s =
+                      nb.create<arith::AddIOp>(nloc, args[2], p).getResult();
+                  nb.create<linalg::YieldOp>(nloc, s);
+                })
+            .getResult(0);
+      };
+
+      auto subMatFromMatI64 = [&](Value lhsM, Value rhsM) -> Value {
+        Value m = builder.create<tensor::DimOp>(loc, lhsM, c0);
+        Value n = builder.create<tensor::DimOp>(loc, lhsM, c1);
+        Value empty = builder
+                          .create<tensor::EmptyOp>(loc, TypeRange{dyn2dI64},
+                                                   ValueRange{m, n})
+                          .getResult();
+        Value init = builder
+                         .create<linalg::FillOp>(loc, ValueRange{z64},
+                                                 ValueRange{empty})
+                         .getResult(0);
+        return builder
+            .create<linalg::GenericOp>(
+                loc, TypeRange{dyn2dI64}, ValueRange{lhsM, rhsM}, ValueRange{init},
+                SmallVector<AffineMap>{
+                    AffineMap::getMultiDimIdentityMap(2, builder.getContext()),
+                    AffineMap::getMultiDimIdentityMap(2, builder.getContext()),
+                    AffineMap::getMultiDimIdentityMap(2, builder.getContext())},
+                SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
+                                                 utils::IteratorType::parallel},
+                [&](OpBuilder &nb, Location nloc, ValueRange args) {
+                  Value d =
+                      nb.create<arith::SubIOp>(nloc, args[0], args[1]).getResult();
+                  nb.create<linalg::YieldOp>(nloc, d);
+                })
+            .getResult(0);
+      };
+
+      auto castVecF32ToI64 = [&](Value vecF32) -> Value {
+        auto vecTy = llvm::dyn_cast<RankedTensorType>(vecF32.getType());
+        if (!vecTy || vecTy.getRank() != 1)
+          return Value();
+        Value len = builder.create<tensor::DimOp>(loc, vecF32, c0);
+        Value empty = builder
+                          .create<tensor::EmptyOp>(loc, TypeRange{vecDynI64},
+                                                   ValueRange{len})
+                          .getResult();
+        Value init = builder
+                         .create<linalg::FillOp>(loc, ValueRange{z64},
+                                                 ValueRange{empty})
+                         .getResult(0);
+        return builder
+            .create<linalg::GenericOp>(
+                loc, TypeRange{vecDynI64}, ValueRange{vecF32}, ValueRange{init},
+                SmallVector<AffineMap>{
+                    AffineMap::getMultiDimIdentityMap(1, builder.getContext()),
+                    AffineMap::getMultiDimIdentityMap(1, builder.getContext())},
+                SmallVector<utils::IteratorType>{utils::IteratorType::parallel},
+                [&](OpBuilder &nb, Location nloc, ValueRange args) {
+                  Value out =
+                      nb.create<arith::FPToSIOp>(nloc, nb.getI64Type(), args[0]).getResult();
+                  nb.create<linalg::YieldOp>(nloc, out);
+                })
+            .getResult(0);
+      };
+
+      auto scaleRowsI64 = [&](Value mat, Value scales) -> Value {
+        Value m = builder.create<tensor::DimOp>(loc, mat, c0);
+        Value n = builder.create<tensor::DimOp>(loc, mat, c1);
+        Value empty = builder
+                          .create<tensor::EmptyOp>(loc, TypeRange{dyn2dI64},
+                                                   ValueRange{m, n})
+                          .getResult();
+        Value init = builder
+                         .create<linalg::FillOp>(loc, ValueRange{z64},
+                                                 ValueRange{empty})
+                         .getResult(0);
+        return builder
+            .create<linalg::GenericOp>(
+                loc, TypeRange{dyn2dI64}, ValueRange{mat, scales}, ValueRange{init},
+                SmallVector<AffineMap>{
+                    AffineMap::getMultiDimIdentityMap(2, builder.getContext()),
+                    AffineMap::get(2, 0, {getAffineDimExpr(0, builder.getContext())},
+                                   builder.getContext()),
+                    AffineMap::getMultiDimIdentityMap(2, builder.getContext())},
+                SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
+                                                 utils::IteratorType::parallel},
+                [&](OpBuilder &nb, Location nloc, ValueRange args) {
+                  Value prod =
+                      nb.create<arith::MulIOp>(nloc, args[0], args[1]).getResult();
+                  nb.create<linalg::YieldOp>(nloc, prod);
+                })
+            .getResult(0);
+      };
+
+      auto scaleColsI64 = [&](Value mat, Value scales) -> Value {
+        Value m = builder.create<tensor::DimOp>(loc, mat, c0);
+        Value n = builder.create<tensor::DimOp>(loc, mat, c1);
+        Value empty = builder
+                          .create<tensor::EmptyOp>(loc, TypeRange{dyn2dI64},
+                                                   ValueRange{m, n})
+                          .getResult();
+        Value init = builder
+                         .create<linalg::FillOp>(loc, ValueRange{z64},
+                                                 ValueRange{empty})
+                         .getResult(0);
+        return builder
+            .create<linalg::GenericOp>(
+                loc, TypeRange{dyn2dI64}, ValueRange{mat, scales}, ValueRange{init},
+                SmallVector<AffineMap>{
+                    AffineMap::getMultiDimIdentityMap(2, builder.getContext()),
+                    AffineMap::get(2, 0, {getAffineDimExpr(1, builder.getContext())},
+                                   builder.getContext()),
+                    AffineMap::getMultiDimIdentityMap(2, builder.getContext())},
+                SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
+                                                 utils::IteratorType::parallel},
+                [&](OpBuilder &nb, Location nloc, ValueRange args) {
+                  Value prod =
+                      nb.create<arith::MulIOp>(nloc, args[0], args[1]).getResult();
+                  nb.create<linalg::YieldOp>(nloc, prod);
+                })
+            .getResult(0);
+      };
+
+      auto maxAbsVecI64 = [&](Value vec) -> Value {
+        Value minI64 = builder.create<arith::ConstantIntOp>(
+            loc, std::numeric_limits<int64_t>::min(), 64);
+        Value empty = builder
+                          .create<tensor::EmptyOp>(loc, TypeRange{scalarI64Ty},
+                                                   ValueRange{})
+                          .getResult();
+        Value init = builder
+                         .create<linalg::FillOp>(loc, ValueRange{minI64},
+                                                 ValueRange{empty})
+                         .getResult(0);
+        Value reduced = builder
+                            .create<linalg::ReduceOp>(
+                                loc, ValueRange{vec}, ValueRange{init},
+                                ArrayRef<int64_t>{0},
+                                [&](OpBuilder &nb, Location nloc, ValueRange args) {
+                                  Value zero =
+                                      nb.create<arith::ConstantIntOp>(nloc, 0, 64);
+                                  Value neg =
+                                      nb.create<arith::SubIOp>(nloc, zero, args[0]).getResult();
+                                  Value isNeg = nb
+                                                    .create<arith::CmpIOp>(
+                                                        nloc, arith::CmpIPredicate::slt,
+                                                        args[0], zero)
+                                                    .getResult();
+                                  Value abs = nb
+                                                  .create<arith::SelectOp>(nloc, isNeg, neg,
+                                                                           args[0])
+                                                  .getResult();
+                                  Value gt = nb
+                                                 .create<arith::CmpIOp>(
+                                                     nloc, arith::CmpIPredicate::sgt, abs,
+                                                     args[1])
+                                                 .getResult();
+                                  Value mx = nb
+                                                 .create<arith::SelectOp>(nloc, gt, abs,
+                                                                          args[1])
+                                                 .getResult();
+                                  nb.create<linalg::YieldOp>(nloc, mx);
+                                })
+                            .getResult(0);
+        return builder.create<tensor::ExtractOp>(loc, reduced).getResult();
+      };
+
+      auto maxAbsDiffVecI64 = [&](Value lhsVec, Value rhsVec) -> Value {
+        Value len = builder.create<tensor::DimOp>(loc, lhsVec, c0);
+        Value empty = builder
+                          .create<tensor::EmptyOp>(loc, TypeRange{vecDynI64},
+                                                   ValueRange{len})
+                          .getResult();
+        Value z = builder.create<arith::ConstantIntOp>(loc, 0, 64);
+        Value init = builder
+                         .create<linalg::FillOp>(loc, ValueRange{z},
+                                                 ValueRange{empty})
+                         .getResult(0);
+        Value diffs = builder
+                          .create<linalg::GenericOp>(
+                              loc, TypeRange{vecDynI64},
+                              ValueRange{lhsVec, rhsVec}, ValueRange{init},
+                              SmallVector<AffineMap>{
+                                  AffineMap::getMultiDimIdentityMap(
+                                      1, builder.getContext()),
+                                  AffineMap::getMultiDimIdentityMap(
+                                      1, builder.getContext()),
+                                  AffineMap::getMultiDimIdentityMap(
+                                      1, builder.getContext())},
+                              SmallVector<utils::IteratorType>{
+                                  utils::IteratorType::parallel},
+                              [&](OpBuilder &nb, Location nloc,
+                                  ValueRange args) {
+                                Value d = nb
+                                              .create<arith::SubIOp>(nloc, args[0],
+                                                                     args[1])
+                                              .getResult();
+                                nb.create<linalg::YieldOp>(nloc, d);
+                              })
+                          .getResult(0);
+        return maxAbsVecI64(diffs);
+      };
+
+      Value lhsI64 = castToI64(lhs);
+      Value rhsI64 = castToI64(rhs);
+      Value initI64 = castToI64(outInit);
+      if (!lhsI64 || !rhsI64 || !initI64) {
+        qmatmul.emitError("Failed to convert quantized tensors to i64");
+        signalPassFailure();
+        return;
+      }
+
+      Value zA64 = extractI64Scalar(lhsZp);
+      Value zB64 = extractI64Scalar(rhsZp);
+      Value lhsAdj = subScalarFromMatI64(lhsI64, zA64);
+      Value rhsAdj = subScalarFromMatI64(rhsI64, zB64);
+      if (!lhsAdj || !rhsAdj) {
+        qmatmul.emitError("Failed to build zero-point-adjusted i64 operands");
+        signalPassFailure();
+        return;
+      }
+
+      // AByzFT scaling on checksum operands in integer domain.
+      Value rowScales = builder
+                            .create<func::CallOp>(
+                                loc, StringRef("sample_row_scales"),
+                                TypeRange{sampleRowFn.getFunctionType().getResult(0)},
+                                ValueRange{lhsF})
+                            .getResult(0);
+      Value colScales = builder
+                            .create<func::CallOp>(
+                                loc, StringRef("sample_col_scales"),
+                                TypeRange{sampleColFn.getFunctionType().getResult(0)},
+                                ValueRange{rhsF})
+                            .getResult(0);
+      Value rowScalesI64 = castVecF32ToI64(rowScales);
+      Value colScalesI64 = castVecF32ToI64(colScales);
+      if (!rowScalesI64 || !colScalesI64) {
+        qmatmul.emitError("Failed to cast sampled scales to i64");
+        signalPassFailure();
+        return;
+      }
+
+      Value lhsAdjScaled = scaleRowsI64(lhsAdj, rowScalesI64);
+      Value rhsAdjScaled = scaleColsI64(rhsAdj, colScalesI64);
+      Value lhsColChecksum = makeChecksumI64(lhsAdjScaled, /*dimToReduce=*/0);
+      Value rhsRowChecksum = makeChecksumI64(rhsAdjScaled, /*dimToReduce=*/1);
+      Value expectedOutRowChecksum = matMulColvecI64(lhsAdjScaled, rhsRowChecksum);
+      Value expectedOutColChecksum = rowvecMulMatI64(lhsColChecksum, rhsAdjScaled);
+
+      builder.setInsertionPointAfter(qmatmul);
+      Value qOut = qmatmul.getResult(0);
+      if (abyzftInjectFault) {
+        qOut = applyAByzFTFault(builder, loc, qOut, abyzftInjectFaultDelta,
+                                abyzftInjectFaultPattern.getValue());
+        qmatmul.emitRemark() << "abyzft-qmatmul: injected "
+                             << abyzftInjectFaultPattern.getValue() << " fault";
+      }
+      Value outI64 = castToI64(qOut);
+      if (!outI64) {
+        qmatmul.emitError("Failed to convert quantized output tensor to i64");
+        signalPassFailure();
+        return;
+      }
+      Value outCmpI64 = subMatFromMatI64(outI64, initI64);
+      Value outScaledRows = scaleRowsI64(outCmpI64, rowScalesI64);
+      Value outScaled = scaleColsI64(outScaledRows, colScalesI64);
+      Value outRowChecksum = makeChecksumI64(outScaled, /*dimToReduce=*/1);
+      Value outColChecksum = makeChecksumI64(outScaled, /*dimToReduce=*/0);
+
+      Value rowDeltaI64 = maxAbsDiffVecI64(expectedOutRowChecksum, outRowChecksum);
+      Value colDeltaI64 = maxAbsDiffVecI64(expectedOutColChecksum, outColChecksum);
+      Value rowExpMaxI64 = maxAbsVecI64(expectedOutRowChecksum);
+      Value rowCalcMaxI64 = maxAbsVecI64(outRowChecksum);
+      Value colExpMaxI64 = maxAbsVecI64(expectedOutColChecksum);
+      Value colCalcMaxI64 = maxAbsVecI64(outColChecksum);
+
+      Value rowMaxDelta =
+          builder.create<arith::SIToFPOp>(loc, builder.getF32Type(), rowDeltaI64);
+      Value colMaxDelta =
+          builder.create<arith::SIToFPOp>(loc, builder.getF32Type(), colDeltaI64);
+      Value rowExpMax =
+          builder.create<arith::SIToFPOp>(loc, builder.getF32Type(), rowExpMaxI64);
+      Value rowCalcMax =
+          builder.create<arith::SIToFPOp>(loc, builder.getF32Type(), rowCalcMaxI64);
+      Value colExpMax =
+          builder.create<arith::SIToFPOp>(loc, builder.getF32Type(), colExpMaxI64);
+      Value colCalcMax =
+          builder.create<arith::SIToFPOp>(loc, builder.getF32Type(), colCalcMaxI64);
+
+      Value indexConst = builder.create<arith::ConstantOp>(
+          loc, builder.getF32Type(),
+          builder.getF32FloatAttr(static_cast<float>(targets.size() + qIndex)));
+      builder.create<func::CallOp>(
+          loc, StringRef("abft_analysis.abft_log_rowcol_delta"), TypeRange{},
+          ValueRange{indexConst, rowMaxDelta, colMaxDelta});
+      if (logRowColDebugFn) {
+        builder.create<func::CallOp>(
+            loc, StringRef("abft_analysis.abft_log_rowcol_debug"), TypeRange{},
+            ValueRange{indexConst, rowExpMax, rowCalcMax, colExpMax, colCalcMax});
+      }
     }
   }
 };
@@ -2465,74 +3487,8 @@ module {
         return;
       targets.push_back(matmul);
     });
-    if (targets.empty() && logRowColDeltaFn) {
-      SmallVector<Operation *, 8> quantTargets;
-      module.walk([&](Operation *op) {
-        auto parentFunc = op->getParentOfType<func::FuncOp>();
-        if (isHelperFunction(parentFunc))
-          return;
-        StringRef name = op->getName().getStringRef();
-        if (name == "linalg.quantized_matmul" ||
-            name == "linalg.conv_2d_nhwc_hwcf_q" ||
-            name == "linalg.depthwise_conv_2d_nhwc_hwcm_q") {
-          quantTargets.push_back(op);
-        }
-      });
-      for (auto [index, op] : llvm::enumerate(quantTargets)) {
-        if (op->getNumResults() == 0)
-          continue;
-        auto outTy = llvm::dyn_cast<RankedTensorType>(op->getResult(0).getType());
-        if (!outTy || !outTy.getElementType().isInteger(32))
-          continue;
-        OpBuilder builder(op);
-        Location loc = op->getLoc();
-        Operation *dup = builder.clone(*op);
-        if (!dup || dup->getNumResults() == 0)
-          continue;
-
-        Value refOut = op->getResult(0);
-        Value dupOut = dup->getResult(0);
-        Block::iterator nextIt = std::next(Block::iterator(op));
-        OpBuilder bAfter(op->getBlock(), nextIt);
-
-        SmallVector<Value> idx;
-        idx.reserve(outTy.getRank());
-        for (int64_t i = 0; i < outTy.getRank(); ++i) {
-          idx.push_back(bAfter.create<arith::ConstantIndexOp>(loc, 0));
-        }
-
-        Value ref0 = bAfter.create<tensor::ExtractOp>(loc, refOut, idx);
-        Value dup0 = bAfter.create<tensor::ExtractOp>(loc, dupOut, idx);
-        if (abyzftInjectFault.getValue()) {
-          StringRef pattern = abyzftInjectFaultPattern.getValue();
-          int base = abyzftInjectFaultDelta.getValue();
-          Value delta = bAfter.create<arith::ConstantIntOp>(loc, base, 32);
-          auto one = bAfter.create<arith::ConstantIntOp>(loc, 1, 32);
-          auto zero = bAfter.create<arith::ConstantIntOp>(loc, 0, 32);
-          auto isNeg = bAfter.create<arith::CmpIOp>(
-              loc, arith::CmpIPredicate::slt, dup0, zero);
-          auto negDup = bAfter.create<arith::SubIOp>(loc, zero, dup0);
-          auto absDup =
-              bAfter.create<arith::SelectOp>(loc, isNeg, negDup, dup0);
-          auto mag = bAfter.create<arith::MaxSIOp>(loc, absDup, one);
-          delta = bAfter.create<arith::MulIOp>(loc, delta, mag);
-          if (pattern == "checkered") {
-            delta = bAfter.create<arith::SubIOp>(loc, zero, delta);
-          }
-          dup0 = bAfter.create<arith::AddIOp>(loc, dup0, delta);
-        }
-        Value refF = bAfter.create<arith::SIToFPOp>(loc, bAfter.getF32Type(), ref0);
-        Value dupF = bAfter.create<arith::SIToFPOp>(loc, bAfter.getF32Type(), dup0);
-        Value diff = bAfter.create<arith::SubFOp>(loc, refF, dupF);
-        Value delta = bAfter.create<math::AbsFOp>(loc, diff);
-        Value layerConst = bAfter.create<arith::ConstantOp>(
-            loc, bAfter.getF32Type(), bAfter.getF32FloatAttr((float)index));
-        bAfter.create<func::CallOp>(
-            loc, StringRef("abft_analysis.abft_log_rowcol_delta"), TypeRange{},
-            ValueRange{layerConst, delta, delta});
-      }
+    if (targets.empty())
       return;
-    }
 
     for (auto [matmulIndex, matmul] : llvm::enumerate(targets)) {
       OpBuilder builder(matmul);

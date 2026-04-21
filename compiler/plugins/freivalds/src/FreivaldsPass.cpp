@@ -23,6 +23,8 @@
 // Command line option parsing for the standalone flag used by the pass.
 #include "llvm/Support/CommandLine.h"
 #include <algorithm>
+#include <cmath>
+#include <ctime>
 
 using namespace mlir;
 using namespace mlir::iree_compiler;
@@ -65,6 +67,27 @@ static llvm::cl::opt<int> freivaldsNumChecks(
     llvm::cl::desc(
         "Number of independent Freivalds projections per matmul (>=1)"),
     llvm::cl::init(1));
+static llvm::cl::opt<bool> freivaldsInjectFault(
+    "freivalds-inject-fault",
+    llvm::cl::desc("Enable deterministic synthetic fault injection for testing"),
+    llvm::cl::init(false));
+static llvm::cl::opt<int> freivaldsInjectFaultDelta(
+    "freivalds-inject-fault-delta",
+    llvm::cl::desc("Fault injection additive delta"),
+    llvm::cl::init(1));
+static llvm::cl::opt<std::string> freivaldsInjectFaultPattern(
+    "freivalds-inject-fault-pattern",
+    llvm::cl::desc("Fault injection pattern: single_point, trivial, checkered"),
+    llvm::cl::init("single_point"));
+
+static int sampleBinaryBit() {
+  static bool seeded = false;
+  if (!seeded) {
+    std::srand(static_cast<unsigned>(std::time(nullptr)));
+    seeded = true;
+  }
+  return std::rand() & 1;
+}
 
 namespace {
 
@@ -94,6 +117,7 @@ struct FreivaldsPass : public PassWrapper<FreivaldsPass, OperationPass<func::Fun
 
   void runOnOperation() override {
     func::FuncOp func = getOperation();
+    (void)freivaldsInjectFaultPattern;
     auto funcName = func.getSymName();
     if (funcName == "column_checksum" || funcName == "row_checksum" ||
         funcName == "matrix_sum" || funcName == "vector_sum" ||
@@ -147,7 +171,8 @@ struct FreivaldsPass : public PassWrapper<FreivaldsPass, OperationPass<func::Fun
     // (e.g. tiny non-matmul graphs used in MLonMCU smoke tests).
     bool hasMatmulTarget = false;
     func.walk([&](Operation *op) {
-      if (op->getName().getStringRef() == "linalg.matmul") {
+      StringRef name = op->getName().getStringRef();
+      if (name == "linalg.matmul") {
         hasMatmulTarget = true;
       }
     });
@@ -1154,22 +1179,9 @@ module {
       maybeInsertDecl("abft_analysis.abft_report_failure", ft);
     }
     if (!module.lookupSymbol<func::FuncOp>(
-            "freivalds_log_rowcol_delta")) {
+            "abft_analysis.abft_log_rowcol_delta")) {
       auto ft = FunctionType::get(ctx, TypeRange{f32, f32, f32}, TypeRange{});
-      auto logFn =
-          modBuilder.create<func::FuncOp>(modLoc, "freivalds_log_rowcol_delta", ft);
-      logFn.setPrivate();
-      Block *entry = logFn.addEntryBlock();
-      OpBuilder lb(entry, entry->begin());
-      Value rowDelta = entry->getArgument(1);
-      Value colDelta = entry->getArgument(2);
-      auto memTy = MemRefType::get({1}, f32);
-      Value c0 = lb.create<arith::ConstantIndexOp>(modLoc, 0);
-      Value merged = lb.create<arith::MaximumFOp>(modLoc, rowDelta, colDelta);
-      Value buf = lb.create<memref::AllocOp>(modLoc, memTy);
-      lb.create<memref::StoreOp>(modLoc, merged, buf, ValueRange{c0});
-      lb.create<memref::DeallocOp>(modLoc, buf);
-      lb.create<func::ReturnOp>(modLoc);
+      maybeInsertDecl("abft_analysis.abft_log_rowcol_delta", ft);
     }
 
     // Collect matmul ops inside this function only to avoid mutating while
@@ -1193,7 +1205,7 @@ module {
                         : module.lookupSymbol<func::FuncOp>(
                               StringRef("vector_sum"));
     auto logRowColDeltaFn =
-        module.lookupSymbol<func::FuncOp>(StringRef("freivalds_log_rowcol_delta"));
+        module.lookupSymbol<func::FuncOp>(StringRef("abft_analysis.abft_log_rowcol_delta"));
     auto epsFn = parsedEps ? parsedEps
                            : module.lookupSymbol<func::FuncOp>(
                                  StringRef("epsilon_compare_abft"));
@@ -1865,7 +1877,8 @@ module {
             int checks = std::max(1, (int)freivaldsNumChecks);
             for (int checkIdx = 0; checkIdx < checks; ++checkIdx) {
               Value randSeed = bAfter.create<arith::ConstantIntOp>(
-                  loc, targetIndex * 131 + checkIdx * 977 + 1, 32);
+                  loc, sampleBinaryBit() + targetIndex * 131 + checkIdx * 977 + 1,
+                  32);
               SmallVector<Type, 1> randRes;
               for (Type t : randVecMulMatFn.getFunctionType().getResults())
                 randRes.push_back(t);
@@ -2150,7 +2163,7 @@ module {
               bAfter.getF32FloatAttr((float)targetIndex));
           if (logRowColDeltaFn) {
             bAfter.create<func::CallOp>(
-                loc, StringRef("freivalds_log_rowcol_delta"),
+                loc, StringRef("abft_analysis.abft_log_rowcol_delta"),
                 TypeRange{}, ValueRange{indexConst, rowMaxDelta, colMaxDelta});
           }
 

@@ -30,6 +30,10 @@ static llvm::cl::opt<bool> abftEnableFuC(
     "abft-enable-fuc",
     llvm::cl::desc("Enable full elementwise checksum (t1/t2) comparisons"),
     llvm::cl::init(false));
+static llvm::cl::opt<bool> abftEnableAnalysisLog(
+    "abft-enable-analysis-log",
+    llvm::cl::desc("Enable ABFT runtime row/column analysis logging"),
+    llvm::cl::init(true));
 
 static llvm::cl::opt<float> abftEpsilonAbs(
   "abft-epsilon-abs",
@@ -73,7 +77,7 @@ struct ABFTPass : public PassWrapper<ABFTPass, OperationPass<func::FuncOp>> {
 
   StringRef getArgument() const final { return "abft-insert-ones"; }
   StringRef getDescription() const final {
-    return "Insert ABFT checks for linalg.matmul and quantized linalg conv ops";
+    return "Insert ABFT checks for linalg.matmul and quantized linalg ops";
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
@@ -113,6 +117,7 @@ struct ABFTPass : public PassWrapper<ABFTPass, OperationPass<func::FuncOp>> {
         funcName == "vector_epsilon_compare_abft" ||
         funcName == "vector_max_abs_diff" ||
         funcName == "vector_max_abs_diff_i32" ||
+        funcName == "vector_max_abs_diff_i64" ||
         funcName == "vector_max_abs_diff_pair" ||
         funcName == "vector_first_elem" || funcName == "scalar_tensor_add" ||
         funcName == "matrix_sub" || funcName == "matrix_add" ||
@@ -125,12 +130,11 @@ struct ABFTPass : public PassWrapper<ABFTPass, OperationPass<func::FuncOp>> {
     // Fast-path: no supported targets means no ABFT instrumentation.
     bool hasTarget = false;
     func.walk([&](Operation *op) {
-      StringRef opName = op->getName().getStringRef();
-      if (opName == "linalg.matmul" || opName == "linalg.quantized_matmul" ||
-          opName == "linalg.conv_2d_nhwc_hwcf_q" ||
-          opName == "linalg.depthwise_conv_2d_nhwc_hwcm_q") {
+      StringRef n = op->getName().getStringRef();
+      if (n == "linalg.matmul" || n == "linalg.quantized_matmul" ||
+          n == "linalg.conv_2d_nhwc_hwcf_q" ||
+          n == "linalg.depthwise_conv_2d_nhwc_hwcm_q")
         hasTarget = true;
-      }
     });
     if (!hasTarget) {
       return;
@@ -523,7 +527,9 @@ module {
       ^bb0(%a: f32, %b: f32, %acc: f32):
         %d = arith.subf %a, %b : f32
         %ad = math.absf %d : f32
-        %m = arith.maximumf %ad, %acc : f32
+        %is_nan = arith.cmpf uno, %ad, %ad : f32
+        %safe_ad = arith.select %is_nan, %zero, %ad : f32
+        %m = arith.maximumf %safe_ad, %acc : f32
         linalg.yield %m : f32
     } -> tensor<f32>
     %res = tensor.extract %out[] : tensor<f32>
@@ -536,82 +542,156 @@ module {
     func::FuncOp parsedVecMaxI32 = ensureFunctionWithBody(
         "vector_max_abs_diff_i32", R"mlir(
 module {
-  func.func @vector_max_abs_diff_i32(%v1: tensor<?xi32>, %v2: tensor<?xi32>) -> f32 {
+  func.func @vector_max_abs_diff_i32(%v1: tensor<?xi32>, %v2: tensor<?xi32>) -> i32 {
     %c0 = arith.constant 0 : index
     %n = tensor.dim %v1, %c0 : tensor<?xi32>
-    %tmp = tensor.empty(%n) : tensor<?xf32>
-    %zero = arith.constant 0.0 : f32
-    %initVec = linalg.fill ins(%zero : f32) outs(%tmp : tensor<?xf32>) -> tensor<?xf32>
+    %tmp = tensor.empty(%n) : tensor<?xi64>
+    %zero = arith.constant 0 : i64
+    %initVec = linalg.fill ins(%zero : i64) outs(%tmp : tensor<?xi64>) -> tensor<?xi64>
     %diff = linalg.generic {
       indexing_maps = [affine_map<(d0)->(d0)>, affine_map<(d0)->(d0)>, affine_map<(d0)->(d0)>],
       iterator_types = ["parallel"]
-    } ins(%v1, %v2 : tensor<?xi32>, tensor<?xi32>) outs(%initVec : tensor<?xf32>) {
-      ^bb0(%a: i32, %b: i32, %acc: f32):
-        %d = arith.subi %a, %b : i32
-        %ad = math.absi %d : i32
-        %adf = arith.sitofp %ad : i32 to f32
-        linalg.yield %adf : f32
-    } -> tensor<?xf32>
-    %empty = tensor.empty() : tensor<f32>
-    %init = linalg.fill ins(%zero : f32) outs(%empty : tensor<f32>) -> tensor<f32>
+    } ins(%v1, %v2 : tensor<?xi32>, tensor<?xi32>) outs(%initVec : tensor<?xi64>) {
+      ^bb0(%a: i32, %b: i32, %acc: i64):
+        %a64 = arith.extsi %a : i32 to i64
+        %b64 = arith.extsi %b : i32 to i64
+        %ge = arith.cmpi sge, %a64, %b64 : i64
+        %mx = arith.select %ge, %a64, %b64 : i64
+        %mn = arith.select %ge, %b64, %a64 : i64
+        %ad = arith.subi %mx, %mn : i64
+        linalg.yield %ad : i64
+    } -> tensor<?xi64>
+    %empty = tensor.empty() : tensor<i64>
+    %init = linalg.fill ins(%zero : i64) outs(%empty : tensor<i64>) -> tensor<i64>
     %out = linalg.generic {
       indexing_maps = [affine_map<(d0)->(d0)>, affine_map<(d0)->()>],
       iterator_types = ["reduction"]
-    } ins(%diff : tensor<?xf32>) outs(%init : tensor<f32>) {
-      ^bb0(%a: f32, %acc: f32):
-        %m = arith.maximumf %a, %acc : f32
-        linalg.yield %m : f32
-    } -> tensor<f32>
-    %res = tensor.extract %out[] : tensor<f32>
-    return %res : f32
+    } ins(%diff : tensor<?xi64>) outs(%init : tensor<i64>) {
+      ^bb0(%a: i64, %acc: i64):
+        %m = arith.maxsi %a, %acc : i64
+        linalg.yield %m : i64
+    } -> tensor<i64>
+    %res64 = tensor.extract %out[] : tensor<i64>
+    %imax = arith.constant 2147483647 : i64
+    %clamped = arith.minsi %res64, %imax : i64
+    %res = arith.trunci %clamped : i64 to i32
+    return %res : i32
   }
 }
 )mlir");
     (void)parsedVecMaxI32;
-
-    // Use linalg.generic instead of cf.br so IREE's lowering pipeline treats
-    // both the function definition and its call sites consistently (no explicit
-    // index dimension args get added to the signature).  A 3-output
-    // linalg.generic tracks (maxDiff, bestA, bestB) in one reduction pass.
-    func::FuncOp parsedVecMaxPair =
-        ensureFunctionWithBody("vector_max_abs_diff_pair", R"mlir(
+    func::FuncOp parsedVecMaxI64 = ensureFunctionWithBody(
+        "vector_max_abs_diff_i64", R"mlir(
 module {
-  func.func @vector_max_abs_diff_pair(%v1: tensor<?xf32>, %v2: tensor<?xf32>) -> (f32, f32) {
-    %neg = arith.constant -1.0 : f32
-    %zero = arith.constant 0.0 : f32
-    %init_diff = tensor.empty() : tensor<f32>
-    %init_a    = tensor.empty() : tensor<f32>
-    %init_b    = tensor.empty() : tensor<f32>
-    %filled_diff = linalg.fill ins(%neg  : f32) outs(%init_diff : tensor<f32>) -> tensor<f32>
-    %filled_a    = linalg.fill ins(%zero : f32) outs(%init_a    : tensor<f32>) -> tensor<f32>
-    %filled_b    = linalg.fill ins(%zero : f32) outs(%init_b    : tensor<f32>) -> tensor<f32>
-    %out_diff, %out_a, %out_b = linalg.generic {
-      indexing_maps = [
-        affine_map<(d0) -> (d0)>,
-        affine_map<(d0) -> (d0)>,
-        affine_map<(d0) -> ()>,
-        affine_map<(d0) -> ()>,
-        affine_map<(d0) -> ()>
-      ],
+  func.func @vector_max_abs_diff_i64(%v1: tensor<?xi64>, %v2: tensor<?xi64>) -> f32 {
+    %empty = tensor.empty() : tensor<i64>
+    %zero_i64 = arith.constant 0 : i64
+    %init = linalg.fill ins(%zero_i64 : i64) outs(%empty : tensor<i64>) -> tensor<i64>
+    %out = linalg.generic {
+      indexing_maps = [affine_map<(d0)->(d0)>, affine_map<(d0)->(d0)>, affine_map<(d0)->()>],
       iterator_types = ["reduction"]
-    } ins(%v1, %v2 : tensor<?xf32>, tensor<?xf32>)
-      outs(%filled_diff, %filled_a, %filled_b : tensor<f32>, tensor<f32>, tensor<f32>) {
-    ^bb0(%a: f32, %b: f32, %cur_diff: f32, %cur_a: f32, %cur_b: f32):
-      %d    = arith.subf %a, %b : f32
-      %ad   = math.absf %d : f32
-      %gt   = arith.cmpf ogt, %ad, %cur_diff : f32
-      %nd   = arith.select %gt, %ad, %cur_diff : f32
-      %na   = arith.select %gt, %a,  %cur_a   : f32
-      %nb   = arith.select %gt, %b,  %cur_b   : f32
-      linalg.yield %nd, %na, %nb : f32, f32, f32
-    } -> (tensor<f32>, tensor<f32>, tensor<f32>)
-    %best_a = tensor.extract %out_a[] : tensor<f32>
-    %best_b = tensor.extract %out_b[] : tensor<f32>
-    return %best_a, %best_b : f32, f32
+    } ins(%v1, %v2 : tensor<?xi64>, tensor<?xi64>) outs(%init : tensor<i64>) {
+      ^bb0(%a: i64, %b: i64, %acc: i64):
+        %ge = arith.cmpi sge, %a, %b : i64
+        %mx = arith.select %ge, %a, %b : i64
+        %mn = arith.select %ge, %b, %a : i64
+        %ad = arith.subi %mx, %mn : i64
+        %m = arith.maxsi %ad, %acc : i64
+        linalg.yield %m : i64
+    } -> tensor<i64>
+    %res_i64 = tensor.extract %out[] : tensor<i64>
+    %res = arith.sitofp %res_i64 : i64 to f32
+    return %res : f32
   }
 }
 )mlir");
-    (void)parsedVecMaxPair;
+    (void)parsedVecMaxI64;
+    func::FuncOp parsedVecMaxI64I32 = ensureFunctionWithBody(
+        "vector_max_abs_diff_i64_i32", R"mlir(
+module {
+  func.func @vector_max_abs_diff_i64_i32(%v1: tensor<?xi64>, %v2: tensor<?xi64>) -> i32 {
+    %empty = tensor.empty() : tensor<i64>
+    %zero_i64 = arith.constant 0 : i64
+    %imax_i64 = arith.constant 2147483647 : i64
+    %init = linalg.fill ins(%zero_i64 : i64) outs(%empty : tensor<i64>) -> tensor<i64>
+    %out = linalg.generic {
+      indexing_maps = [affine_map<(d0)->(d0)>, affine_map<(d0)->(d0)>, affine_map<(d0)->()>],
+      iterator_types = ["reduction"]
+    } ins(%v1, %v2 : tensor<?xi64>, tensor<?xi64>) outs(%init : tensor<i64>) {
+      ^bb0(%a: i64, %b: i64, %acc: i64):
+        %ge = arith.cmpi sge, %a, %b : i64
+        %mx = arith.select %ge, %a, %b : i64
+        %mn = arith.select %ge, %b, %a : i64
+        %ad = arith.subi %mx, %mn : i64
+        %m = arith.maxsi %ad, %acc : i64
+        linalg.yield %m : i64
+    } -> tensor<i64>
+    %res_i64 = tensor.extract %out[] : tensor<i64>
+    %clamped = arith.minsi %res_i64, %imax_i64 : i64
+    %res = arith.trunci %clamped : i64 to i32
+    return %res : i32
+  }
+}
+)mlir");
+    (void)parsedVecMaxI64I32;
+    func::FuncOp parsedVecMaxAbsI64 = ensureFunctionWithBody(
+        "vector_max_abs_i64", R"mlir(
+module {
+  func.func @vector_max_abs_i64(%v: tensor<?xi64>) -> f32 {
+    %empty = tensor.empty() : tensor<i64>
+    %zero_i64 = arith.constant 0 : i64
+    %init = linalg.fill ins(%zero_i64 : i64) outs(%empty : tensor<i64>) -> tensor<i64>
+    %out = linalg.generic {
+      indexing_maps = [affine_map<(d0)->(d0)>, affine_map<(d0)->()>],
+      iterator_types = ["reduction"]
+    } ins(%v : tensor<?xi64>) outs(%init : tensor<i64>) {
+      ^bb0(%a: i64, %acc: i64):
+        %zero_i64_2 = arith.constant 0 : i64
+        %neg = arith.subi %zero_i64_2, %a : i64
+        %isNeg = arith.cmpi slt, %a, %zero_i64_2 : i64
+        %abs = arith.select %isNeg, %neg, %a : i64
+        %m = arith.maxsi %abs, %acc : i64
+        linalg.yield %m : i64
+    } -> tensor<i64>
+    %res_i64 = tensor.extract %out[] : tensor<i64>
+    %res = arith.sitofp %res_i64 : i64 to f32
+    return %res : f32
+  }
+}
+)mlir");
+    (void)parsedVecMaxAbsI64;
+    func::FuncOp parsedVecMaxAbsI64I32 = ensureFunctionWithBody(
+        "vector_max_abs_i64_i32", R"mlir(
+module {
+  func.func @vector_max_abs_i64_i32(%v: tensor<?xi64>) -> i32 {
+    %empty = tensor.empty() : tensor<i64>
+    %zero_i64 = arith.constant 0 : i64
+    %imax_i64 = arith.constant 2147483647 : i64
+    %init = linalg.fill ins(%zero_i64 : i64) outs(%empty : tensor<i64>) -> tensor<i64>
+    %out = linalg.generic {
+      indexing_maps = [affine_map<(d0)->(d0)>, affine_map<(d0)->()>],
+      iterator_types = ["reduction"]
+    } ins(%v : tensor<?xi64>) outs(%init : tensor<i64>) {
+      ^bb0(%a: i64, %acc: i64):
+        %zero_i64_2 = arith.constant 0 : i64
+        %neg = arith.subi %zero_i64_2, %a : i64
+        %isNeg = arith.cmpi slt, %a, %zero_i64_2 : i64
+        %abs = arith.select %isNeg, %neg, %a : i64
+        %m = arith.maxsi %abs, %acc : i64
+        linalg.yield %m : i64
+    } -> tensor<i64>
+    %res_i64 = tensor.extract %out[] : tensor<i64>
+    %clamped = arith.minsi %res_i64, %imax_i64 : i64
+    %res = arith.trunci %clamped : i64 to i32
+    return %res : i32
+  }
+}
+)mlir");
+    (void)parsedVecMaxAbsI64I32;
+
+    // NOTE: Keep vector_max_abs_diff_pair disabled for stability in the EmitC
+    // pipeline. ABFT logging uses scalar max-diff helpers and does not require
+    // this helper.
 
     func::FuncOp parsedVecMaxAbs =
         ensureFunctionWithBody("vector_max_abs", R"mlir(
@@ -827,12 +907,34 @@ module {
     if (!module.lookupSymbol<func::FuncOp>("vector_max_abs_diff_i32")) {
       auto i32Ty = modBuilder.getI32Type();
       auto vecDynI32 = RankedTensorType::get({ShapedType::kDynamic}, i32Ty);
-      auto ft = FunctionType::get(ctx, TypeRange{vecDynI32, vecDynI32}, TypeRange{f32});
+      auto ft = FunctionType::get(ctx, TypeRange{vecDynI32, vecDynI32}, TypeRange{i32Ty});
       maybeInsertDecl("vector_max_abs_diff_i32", ft);
     }
-    if (!module.lookupSymbol<func::FuncOp>("vector_max_abs_diff_pair")) {
-      auto ft = FunctionType::get(ctx, TypeRange{vecDyn, vecDyn}, TypeRange{f32, f32});
-      maybeInsertDecl("vector_max_abs_diff_pair", ft);
+    if (!module.lookupSymbol<func::FuncOp>("vector_max_abs_diff_i64")) {
+      auto i64Ty = modBuilder.getI64Type();
+      auto vecDynI64 = RankedTensorType::get({ShapedType::kDynamic}, i64Ty);
+      auto ft = FunctionType::get(ctx, TypeRange{vecDynI64, vecDynI64}, TypeRange{f32});
+      maybeInsertDecl("vector_max_abs_diff_i64", ft);
+    }
+    if (!module.lookupSymbol<func::FuncOp>("vector_max_abs_i64")) {
+      auto i64Ty = modBuilder.getI64Type();
+      auto vecDynI64 = RankedTensorType::get({ShapedType::kDynamic}, i64Ty);
+      auto ft = FunctionType::get(ctx, TypeRange{vecDynI64}, TypeRange{f32});
+      maybeInsertDecl("vector_max_abs_i64", ft);
+    }
+    if (!module.lookupSymbol<func::FuncOp>("vector_max_abs_diff_i64_i32")) {
+      auto i64Ty = modBuilder.getI64Type();
+      auto i32Ty = modBuilder.getI32Type();
+      auto vecDynI64 = RankedTensorType::get({ShapedType::kDynamic}, i64Ty);
+      auto ft = FunctionType::get(ctx, TypeRange{vecDynI64, vecDynI64}, TypeRange{i32Ty});
+      maybeInsertDecl("vector_max_abs_diff_i64_i32", ft);
+    }
+    if (!module.lookupSymbol<func::FuncOp>("vector_max_abs_i64_i32")) {
+      auto i64Ty = modBuilder.getI64Type();
+      auto i32Ty = modBuilder.getI32Type();
+      auto vecDynI64 = RankedTensorType::get({ShapedType::kDynamic}, i64Ty);
+      auto ft = FunctionType::get(ctx, TypeRange{vecDynI64}, TypeRange{i32Ty});
+      maybeInsertDecl("vector_max_abs_i64_i32", ft);
     }
     if (!module.lookupSymbol<func::FuncOp>("vector_first_elem")) {
       auto ft = FunctionType::get(ctx, TypeRange{vecDyn}, TypeRange{f32});
@@ -859,27 +961,29 @@ module {
       auto ft = FunctionType::get(ctx, TypeRange{f32}, TypeRange{});
       maybeInsertDecl("abft_analysis.abft_report_failure", ft);
     }
-    if (!module.lookupSymbol<func::FuncOp>(
-            "abft_analysis.abft_log_rowcol_delta")) {
-      auto ft = FunctionType::get(ctx, TypeRange{f32, f32, f32}, TypeRange{});
-      maybeInsertDecl("abft_analysis.abft_log_rowcol_delta", ft);
-    }
-    if (!module.lookupSymbol<func::FuncOp>(
-            "abft_analysis.abft_log_rowcol_debug")) {
-      auto ft = FunctionType::get(
-          ctx, TypeRange{f32, f32, f32, f32, f32},
-          TypeRange{});
-      maybeInsertDecl("abft_analysis.abft_log_rowcol_debug", ft);
+    if (abftEnableAnalysisLog) {
+      if (!module.lookupSymbol<func::FuncOp>(
+              "abft_analysis.abft_log_rowcol_delta")) {
+        auto ft = FunctionType::get(ctx, TypeRange{f32, f32, f32}, TypeRange{});
+        maybeInsertDecl("abft_analysis.abft_log_rowcol_delta", ft);
+      }
+      if (!module.lookupSymbol<func::FuncOp>(
+              "abft_analysis.abft_log_rowcol_debug")) {
+        auto ft = FunctionType::get(
+            ctx, TypeRange{f32, f32, f32, f32, f32},
+            TypeRange{});
+        maybeInsertDecl("abft_analysis.abft_log_rowcol_debug", ft);
+      }
     }
 
     // Collect targets inside this function only to avoid mutating while
     // walking.
     SmallVector<Operation *, 8> targets;
     func.walk([&](Operation *op) {
-      StringRef name = op->getName().getStringRef();
-      if (name == "linalg.matmul" || name == "linalg.quantized_matmul" ||
-          name == "linalg.conv_2d_nhwc_hwcf_q" ||
-          name == "linalg.depthwise_conv_2d_nhwc_hwcm_q")
+      StringRef n = op->getName().getStringRef();
+      if (n == "linalg.matmul" || n == "linalg.quantized_matmul" ||
+          n == "linalg.conv_2d_nhwc_hwcf_q" ||
+          n == "linalg.depthwise_conv_2d_nhwc_hwcm_q")
         targets.push_back(op);
     });
 
@@ -905,8 +1009,14 @@ module {
         module.lookupSymbol<func::FuncOp>(StringRef("vector_max_abs_diff"));
     auto vecMaxI32Fn =
         module.lookupSymbol<func::FuncOp>(StringRef("vector_max_abs_diff_i32"));
-    auto vecMaxPairFn =
-        module.lookupSymbol<func::FuncOp>(StringRef("vector_max_abs_diff_pair"));
+    auto vecMaxI64Fn =
+        module.lookupSymbol<func::FuncOp>(StringRef("vector_max_abs_diff_i64"));
+    auto vecMaxAbsI64Fn =
+        module.lookupSymbol<func::FuncOp>(StringRef("vector_max_abs_i64"));
+    auto vecMaxI64I32Fn =
+        module.lookupSymbol<func::FuncOp>(StringRef("vector_max_abs_diff_i64_i32"));
+    auto vecMaxAbsI64I32Fn =
+        module.lookupSymbol<func::FuncOp>(StringRef("vector_max_abs_i64_i32"));
     auto vecFirstFn =
         module.lookupSymbol<func::FuncOp>(StringRef("vector_first_elem"));
     auto matrixSubFn =
@@ -918,10 +1028,12 @@ module {
     auto scalarAddFn =
       module.lookupSymbol<func::FuncOp>(StringRef("scalar_tensor_add"));
 
-    if (false && abftInjectFault) {
-      // Create combination helpers that inject faults as matrix addition
-      func::FuncOp faultI32Single = ensureFunctionWithBody(
-          "apply_fault_i32_single_point", R"mlir(
+    if (abftInjectFault) {
+      // Emit only the requested i32 helper to minimize added IR and keep
+      // lowering surface small for EmitC.
+      StringRef pattern = abftInjectFaultPattern.getValue();
+      if (pattern == "single_point") {
+        (void)ensureFunctionWithBody("apply_fault_i32_single_point", R"mlir(
 module {
   func.func @apply_fault_i32_single_point(%mat: tensor<?x?xi32>, %delta: i32) -> tensor<?x?xi32> {
     %c0 = arith.constant 0 : index
@@ -949,10 +1061,8 @@ module {
   }
 }
 )mlir");
-      (void)faultI32Single;
-
-      func::FuncOp faultI32Trivial = ensureFunctionWithBody(
-          "apply_fault_i32_trivial", R"mlir(
+      } else if (pattern == "trivial") {
+        (void)ensureFunctionWithBody("apply_fault_i32_trivial", R"mlir(
 module {
   func.func @apply_fault_i32_trivial(%mat: tensor<?x?xi32>, %delta: i32) -> tensor<?x?xi32> {
     %c0 = arith.constant 0 : index
@@ -988,10 +1098,8 @@ module {
   }
 }
 )mlir");
-      (void)faultI32Trivial;
-
-      func::FuncOp faultI32Checkered = ensureFunctionWithBody(
-          "apply_fault_i32_checkered", R"mlir(
+      } else {
+        (void)ensureFunctionWithBody("apply_fault_i32_checkered", R"mlir(
 module {
   func.func @apply_fault_i32_checkered(%mat: tensor<?x?xi32>, %delta: i32) -> tensor<?x?xi32> {
     %c0 = arith.constant 0 : index
@@ -1020,268 +1128,735 @@ module {
   }
 }
 )mlir");
-      (void)faultI32Checkered;
-
-      func::FuncOp faultF32Single = ensureFunctionWithBody(
-          "apply_fault_f32_single_point", R"mlir(
-module {
-  func.func @apply_fault_f32_single_point(%mat: tensor<?x?xf32>, %delta: f32) -> tensor<?x?xf32> {
-    %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
-    %rows = tensor.dim %mat, %c0 : tensor<?x?xf32>
-    %cols = tensor.dim %mat, %c1 : tensor<?x?xf32>
-    %empty = tensor.empty(%rows, %cols) : tensor<?x?xf32>
-    %zero = arith.constant 0.0 : f32
-    %init = linalg.fill ins(%zero : f32) outs(%empty : tensor<?x?xf32>) -> tensor<?x?xf32>
-    %res = linalg.generic {
-      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>],
-      iterator_types = ["parallel", "parallel"]
-    } ins(%mat : tensor<?x?xf32>) outs(%init : tensor<?x?xf32>) {
-      ^bb0(%a: f32, %acc: f32):
-        %i = linalg.index 0 : index
-        %j = linalg.index 1 : index
-        %hit_i = arith.cmpi eq, %i, %c0 : index
-        %hit_j = arith.cmpi eq, %j, %c0 : index
-        %hit = arith.andi %hit_i, %hit_j : i1
-        %res = arith.select %hit, %delta, %zero : f32
-        %sum = arith.addf %a, %res : f32
-        linalg.yield %sum : f32
-    } -> tensor<?x?xf32>
-    return %res : tensor<?x?xf32>
-  }
-}
-)mlir");
-      (void)faultF32Single;
-
-      func::FuncOp faultF32Trivial = ensureFunctionWithBody(
-          "apply_fault_f32_trivial", R"mlir(
-module {
-  func.func @apply_fault_f32_trivial(%mat: tensor<?x?xf32>, %delta: f32) -> tensor<?x?xf32> {
-    %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
-    %c2 = arith.constant 2 : index
-    %rows = tensor.dim %mat, %c0 : tensor<?x?xf32>
-    %cols = tensor.dim %mat, %c1 : tensor<?x?xf32>
-    %empty = tensor.empty(%rows, %cols) : tensor<?x?xf32>
-    %zero = arith.constant 0.0 : f32
-    %init = linalg.fill ins(%zero : f32) outs(%empty : tensor<?x?xf32>) -> tensor<?x?xf32>
-    %res = linalg.generic {
-      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>],
-      iterator_types = ["parallel", "parallel"]
-    } ins(%mat : tensor<?x?xf32>) outs(%init : tensor<?x?xf32>) {
-      ^bb0(%a: f32, %acc: f32):
-        %i = linalg.index 0 : index
-        %j = linalg.index 1 : index
-        %in_i = arith.cmpi ult, %i, %c2 : index
-        %in_j = arith.cmpi ult, %j, %c2 : index
-        %in_blk = arith.andi %in_i, %in_j : i1
-        %im = arith.remui %i, %c2 : index
-        %jm = arith.remui %j, %c2 : index
-        %diag = arith.cmpi eq, %im, %jm : index
-        %plus_delta = arith.addf %delta, %zero : f32
-        %zero_f32 = arith.constant 0.0 : f32
-        %minus_delta = arith.subf %zero_f32, %delta : f32
-        %fault = arith.select %diag, %plus_delta, %minus_delta : f32
-        %fault_val = arith.select %in_blk, %fault, %zero : f32
-        %sum = arith.addf %a, %fault_val : f32
-        linalg.yield %sum : f32
-    } -> tensor<?x?xf32>
-    return %res : tensor<?x?xf32>
-  }
-}
-)mlir");
-      (void)faultF32Trivial;
-
-      func::FuncOp faultF32Checkered = ensureFunctionWithBody(
-          "apply_fault_f32_checkered", R"mlir(
-module {
-  func.func @apply_fault_f32_checkered(%mat: tensor<?x?xf32>, %delta: f32) -> tensor<?x?xf32> {
-    %c0 = arith.constant 0 : index
-    %c2 = arith.constant 2 : index
-    %rows = tensor.dim %mat, %c0 : tensor<?x?xf32>
-    %c1 = arith.constant 1 : index
-    %cols = tensor.dim %mat, %c1 : tensor<?x?xf32>
-    %empty = tensor.empty(%rows, %cols) : tensor<?x?xf32>
-    %zero = arith.constant 0.0 : f32
-    %init = linalg.fill ins(%zero : f32) outs(%empty : tensor<?x?xf32>) -> tensor<?x?xf32>
-    %res = linalg.generic {
-      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>],
-      iterator_types = ["parallel", "parallel"]
-    } ins(%mat : tensor<?x?xf32>) outs(%init : tensor<?x?xf32>) {
-      ^bb0(%a: f32, %acc: f32):
-        %i = linalg.index 0 : index
-        %im = arith.remui %i, %c2 : index
-        %is_even = arith.cmpi eq, %im, %c0 : index
-        %zero_f32 = arith.constant 0.0 : f32
-        %minus_delta = arith.subf %zero_f32, %delta : f32
-        %fault = arith.select %is_even, %delta, %minus_delta : f32
-        %sum = arith.addf %a, %fault : f32
-        linalg.yield %sum : f32
-    } -> tensor<?x?xf32>
-    return %res : tensor<?x?xf32>
-  }
-}
-)mlir");
-      (void)faultF32Checkered;
+      }
     }
     int64_t layerOrdinal = 0;
     for (Operation *op : targets) {
       int64_t currentLayer = layerOrdinal++;
       StringRef targetName = op->getName().getStringRef();
-      if ((targetName == "linalg.quantized_matmul" ||
+        if ((targetName == "linalg.quantized_matmul" ||
            targetName == "linalg.conv_2d_nhwc_hwcf_q" ||
            targetName == "linalg.depthwise_conv_2d_nhwc_hwcm_q")) {
-        if (!vecMaxI32Fn || !logRowColDeltaFn || op->getNumResults() == 0) {
-          op->emitRemark() << "abft-qconv: missing helper(s), skipping quantized instrumentation";
+        auto qmm = dyn_cast<linalg::QuantizedMatmulOp>(op);
+        if (!qmm || !vecMaxI64Fn || !vecMaxAbsI64Fn ||
+          (abftEnableAnalysisLog && !logRowColDeltaFn) ||
+          op->getNumResults() == 0) {
+          op->emitRemark()
+            << "abft-qmatmul: missing helper(s), skipping quantized instrumentation";
+          continue;
+        }
+
+        auto outTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+        if (!outTy || !outTy.getElementType().isInteger(32)) {
+          op->emitRemark()
+            << "abft-qmatmul: unsupported output type; expected ranked tensor<i32>";
+          continue;
+        }
+
+        Location loc = op->getLoc();
+        Block::iterator nextIt = std::next(Block::iterator(op));
+        OpBuilder bAfter(op->getBlock(), nextIt);
+
+        Value lhs = qmm.getDpsInputOperand(0)->get();
+        Value rhs = qmm.getDpsInputOperand(1)->get();
+        Value lhsZp = qmm.getDpsInputOperand(2)->get();
+        Value rhsZp = qmm.getDpsInputOperand(3)->get();
+        Value outInit = qmm.getDpsInitOperand(0)->get();
+        Value outRes = qmm.getResult(0);
+
+        auto lhsTy = dyn_cast<RankedTensorType>(lhs.getType());
+        auto rhsTy = dyn_cast<RankedTensorType>(rhs.getType());
+        if (!lhsTy || !rhsTy || lhsTy.getRank() != 2 || rhsTy.getRank() != 2) {
+          op->emitRemark() << "abft-qmatmul: expected rank-2 lhs/rhs";
+          continue;
+        }
+
+        auto dyn2dI64 = RankedTensorType::get(
+          {ShapedType::kDynamic, ShapedType::kDynamic}, bAfter.getI64Type());
+        auto vecDynI64 =
+          RankedTensorType::get({ShapedType::kDynamic}, bAfter.getI64Type());
+
+        // Fault injection must mutate the produced matmul result (not just the
+        // checksum path), so downstream users observe the injected fault.
+        if (abftInjectFault) {
+          StringRef pattern = abftInjectFaultPattern.getValue();
+          StringRef injectFn = "apply_fault_i32_single_point";
+          if (pattern == "trivial") {
+            injectFn = "apply_fault_i32_trivial";
+          } else if (pattern == "checkered") {
+            injectFn = "apply_fault_i32_checkered";
+          }
+          auto injectSym = module.lookupSymbol<func::FuncOp>(injectFn);
+          if (injectSym) {
+            SmallVector<Type, 1> injTypes;
+            for (Type t : injectSym.getFunctionType().getResults()) {
+              injTypes.push_back(t);
+            }
+            Value injArg = outRes;
+            Type expectedIn = injectSym.getFunctionType().getInput(0);
+            if (injArg.getType() != expectedIn) {
+              auto inTy = dyn_cast<RankedTensorType>(injArg.getType());
+              auto expTy = dyn_cast<RankedTensorType>(expectedIn);
+              if (inTy && expTy && inTy.getRank() == expTy.getRank()) {
+                injArg = bAfter.create<tensor::CastOp>(loc, expectedIn, injArg).getResult();
+              } else {
+                op->emitRemark()
+                  << "abft-qmatmul: pattern injection rank mismatch, skipping fault injection";
+                injectSym = {};
+              }
+            }
+            if (injectSym) {
+              auto deltaVal = bAfter.create<arith::ConstantIntOp>(
+                loc, abftInjectFaultDelta, /*width=*/32);
+              Value injected = bAfter
+                .create<func::CallOp>(loc, injectFn, TypeRange(injTypes),
+                                      ValueRange{injArg, deltaVal.getResult()})
+                .getResult(0);
+              if (injected.getType() != outRes.getType()) {
+                injected = bAfter.create<tensor::CastOp>(loc, outRes.getType(), injected).getResult();
+              }
+              Operation *injOp = injected.getDefiningOp();
+              SmallVector<OpOperand *, 8> usesToRewrite;
+              for (OpOperand &use : outRes.getUses()) {
+                Operation *owner = use.getOwner();
+                if (owner == injArg.getDefiningOp()) {
+                  continue;
+                }
+                if (owner->getBlock() == injOp->getBlock() && injOp->isBeforeInBlock(owner)) {
+                  usesToRewrite.push_back(&use);
+                }
+              }
+              for (OpOperand *use : usesToRewrite) {
+                use->set(injected);
+              }
+              outRes = injected;
+              op->emitRemark() << "abft-qmatmul: injected " << pattern << " fault";
+            }
+          } else {
+            op->emitRemark() << "abft-qmatmul: missing fault helper, skipping fault injection";
+          }
+        }
+
+        Value c0 = bAfter.create<arith::ConstantIndexOp>(loc, 0);
+        Value c1 = bAfter.create<arith::ConstantIndexOp>(loc, 1);
+        Value z64 = bAfter.create<arith::ConstantIntOp>(loc, 0, 64);
+
+        auto castToI64 = [&](Value v) -> Value {
+          auto ty = dyn_cast<RankedTensorType>(v.getType());
+          if (!ty || ty.getRank() != 2 || !isa<IntegerType>(ty.getElementType()))
+          return Value();
+          Value m = bAfter.create<tensor::DimOp>(loc, v, c0);
+          Value n = bAfter.create<tensor::DimOp>(loc, v, c1);
+          Value empty = bAfter.create<tensor::EmptyOp>(loc, TypeRange{dyn2dI64},
+                                 ValueRange{m, n}).getResult();
+          Value init = bAfter.create<linalg::FillOp>(loc, ValueRange{z64},
+                               ValueRange{empty}).getResult(0);
+          return bAfter
+            .create<linalg::GenericOp>(
+              loc, TypeRange{dyn2dI64}, ValueRange{v}, ValueRange{init},
+              SmallVector<AffineMap>{
+                AffineMap::getMultiDimIdentityMap(2, bAfter.getContext()),
+                AffineMap::getMultiDimIdentityMap(2, bAfter.getContext())},
+              SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
+                               utils::IteratorType::parallel},
+              [&](OpBuilder &nb, Location nloc, ValueRange args) {
+              Value ex =
+                nb.create<arith::ExtSIOp>(nloc, nb.getI64Type(), args[0]).getResult();
+              nb.create<linalg::YieldOp>(nloc, ex);
+              })
+            .getResult(0);
+        };
+
+        auto makeChecksumI64 = [&](Value in, int64_t dimToReduce) -> Value {
+          Value outLen =
+            (dimToReduce == 0)
+              ? bAfter.create<tensor::DimOp>(loc, in, c1).getResult()
+              : bAfter.create<tensor::DimOp>(loc, in, c0).getResult();
+          Value empty =
+            bAfter.create<tensor::EmptyOp>(loc, TypeRange{vecDynI64},
+                           ValueRange{outLen}).getResult();
+          Value init =
+            bAfter.create<linalg::FillOp>(loc, ValueRange{z64}, ValueRange{empty})
+              .getResult(0);
+          return bAfter
+            .create<linalg::ReduceOp>(
+              loc, ValueRange{in}, ValueRange{init},
+              ArrayRef<int64_t>{dimToReduce},
+              [&](OpBuilder &nb, Location nloc, ValueRange args) {
+              Value sum =
+                nb.create<arith::AddIOp>(nloc, args[0], args[1]).getResult();
+              nb.create<linalg::YieldOp>(nloc, sum);
+              })
+            .getResult(0);
+        };
+
+        auto subScalarFromMatI64 = [&](Value mat, Value scalarI64) -> Value {
+          Value m = bAfter.create<tensor::DimOp>(loc, mat, c0);
+          Value n = bAfter.create<tensor::DimOp>(loc, mat, c1);
+          Value empty = bAfter.create<tensor::EmptyOp>(loc, TypeRange{dyn2dI64},
+                                 ValueRange{m, n}).getResult();
+          Value init = bAfter.create<linalg::FillOp>(loc, ValueRange{z64},
+                               ValueRange{empty}).getResult(0);
+          return bAfter
+            .create<linalg::GenericOp>(
+              loc, TypeRange{dyn2dI64}, ValueRange{mat, scalarI64},
+              ValueRange{init},
+              SmallVector<AffineMap>{
+                AffineMap::getMultiDimIdentityMap(2, bAfter.getContext()),
+                AffineMap::get(2, 0, {}, bAfter.getContext()),
+                AffineMap::getMultiDimIdentityMap(2, bAfter.getContext())},
+              SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
+                               utils::IteratorType::parallel},
+              [&](OpBuilder &nb, Location nloc, ValueRange args) {
+              Value d =
+                nb.create<arith::SubIOp>(nloc, args[0], args[1]).getResult();
+              nb.create<linalg::YieldOp>(nloc, d);
+              })
+            .getResult(0);
+        };
+
+        auto matMulColvecI64 = [&](Value mat, Value vec) -> Value {
+          Value m = bAfter.create<tensor::DimOp>(loc, mat, c0);
+          Value empty =
+            bAfter.create<tensor::EmptyOp>(loc, TypeRange{vecDynI64}, ValueRange{m})
+              .getResult();
+          Value init =
+            bAfter.create<linalg::FillOp>(loc, ValueRange{z64}, ValueRange{empty})
+              .getResult(0);
+          return bAfter
+            .create<linalg::GenericOp>(
+              loc, TypeRange{vecDynI64}, ValueRange{mat, vec}, ValueRange{init},
+              SmallVector<AffineMap>{
+                AffineMap::get(2, 0, {getAffineDimExpr(0, bAfter.getContext()),
+                          getAffineDimExpr(1, bAfter.getContext())},
+                       bAfter.getContext()),
+                AffineMap::get(2, 0, {getAffineDimExpr(1, bAfter.getContext())},
+                       bAfter.getContext()),
+                AffineMap::get(2, 0, {getAffineDimExpr(0, bAfter.getContext())},
+                       bAfter.getContext())},
+              SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
+                               utils::IteratorType::reduction},
+              [&](OpBuilder &nb, Location nloc, ValueRange args) {
+              Value p =
+                nb.create<arith::MulIOp>(nloc, args[0], args[1]).getResult();
+              Value s =
+                nb.create<arith::AddIOp>(nloc, args[2], p).getResult();
+              nb.create<linalg::YieldOp>(nloc, s);
+              })
+            .getResult(0);
+        };
+
+        auto rowvecMulMatI64 = [&](Value rowv, Value mat) -> Value {
+          Value n = bAfter.create<tensor::DimOp>(loc, mat, c1);
+          Value empty =
+            bAfter.create<tensor::EmptyOp>(loc, TypeRange{vecDynI64}, ValueRange{n})
+              .getResult();
+          Value init =
+            bAfter.create<linalg::FillOp>(loc, ValueRange{z64}, ValueRange{empty})
+              .getResult(0);
+          return bAfter
+            .create<linalg::GenericOp>(
+              loc, TypeRange{vecDynI64}, ValueRange{rowv, mat}, ValueRange{init},
+              SmallVector<AffineMap>{
+                AffineMap::get(2, 0, {getAffineDimExpr(1, bAfter.getContext())},
+                       bAfter.getContext()),
+                AffineMap::get(2, 0, {getAffineDimExpr(1, bAfter.getContext()),
+                          getAffineDimExpr(0, bAfter.getContext())},
+                       bAfter.getContext()),
+                AffineMap::get(2, 0, {getAffineDimExpr(0, bAfter.getContext())},
+                       bAfter.getContext())},
+              SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
+                               utils::IteratorType::reduction},
+              [&](OpBuilder &nb, Location nloc, ValueRange args) {
+              Value p =
+                nb.create<arith::MulIOp>(nloc, args[0], args[1]).getResult();
+              Value s =
+                nb.create<arith::AddIOp>(nloc, args[2], p).getResult();
+              nb.create<linalg::YieldOp>(nloc, s);
+              })
+            .getResult(0);
+        };
+
+          auto subMatFromMatI64 = [&](Value lhsM, Value rhsM) -> Value {
+            Value m = bAfter.create<tensor::DimOp>(loc, lhsM, c0);
+            Value n = bAfter.create<tensor::DimOp>(loc, lhsM, c1);
+            Value empty = bAfter.create<tensor::EmptyOp>(
+              loc, TypeRange{dyn2dI64}, ValueRange{m, n}).getResult();
+            Value init = bAfter
+                     .create<linalg::FillOp>(loc, ValueRange{z64},
+                                 ValueRange{empty})
+                     .getResult(0);
+            return bAfter
+              .create<linalg::GenericOp>(
+                loc, TypeRange{dyn2dI64}, ValueRange{lhsM, rhsM},
+                ValueRange{init},
+                SmallVector<AffineMap>{
+                  AffineMap::getMultiDimIdentityMap(2, bAfter.getContext()),
+                  AffineMap::getMultiDimIdentityMap(2, bAfter.getContext()),
+                  AffineMap::getMultiDimIdentityMap(2, bAfter.getContext())},
+                SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
+                                 utils::IteratorType::parallel},
+                [&](OpBuilder &nb, Location nloc, ValueRange args) {
+                Value d =
+                  nb.create<arith::SubIOp>(nloc, args[0], args[1]).getResult();
+                nb.create<linalg::YieldOp>(nloc, d);
+                })
+              .getResult(0);
+          };
+
+        auto extractI64Scalar = [&](Value v) -> Value {
+          if (auto ty = dyn_cast<RankedTensorType>(v.getType())) {
+          if (ty.getRank() == 0) {
+            Value s = bAfter.create<tensor::ExtractOp>(loc, v).getResult();
+            if (s.getType().isInteger(64)) return s;
+            return bAfter.create<arith::ExtSIOp>(loc, bAfter.getI64Type(), s)
+              .getResult();
+          }
+          }
+          if (v.getType().isInteger(64)) return v;
+          return bAfter.create<arith::ExtSIOp>(loc, bAfter.getI64Type(), v)
+            .getResult();
+        };
+
+        Value lhsI64 = castToI64(lhs);
+        Value rhsI64 = castToI64(rhs);
+        Value outI64 = castToI64(outRes);
+        Value initI64 = castToI64(outInit);
+        if (!lhsI64 || !rhsI64 || !outI64 || !initI64) {
+          op->emitRemark() << "abft-qmatmul: failed i64 conversion";
+          continue;
+        }
+
+        Value zA64 = extractI64Scalar(lhsZp);
+        Value zB64 = extractI64Scalar(rhsZp);
+
+        Value lhsAdj = subScalarFromMatI64(lhsI64, zA64);
+        Value rhsAdj = subScalarFromMatI64(rhsI64, zB64);
+
+        Value lhsCol = makeChecksumI64(lhsAdj, /*dimToReduce=*/0);
+        Value rhsRow = makeChecksumI64(rhsAdj, /*dimToReduce=*/1);
+        Value propRow = matMulColvecI64(lhsAdj, rhsRow);
+        Value propCol = rowvecMulMatI64(lhsCol, rhsAdj);
+        Value expRow64 = propRow;
+        Value expCol64 = propCol;
+
+        Value outCmpI64 = subMatFromMatI64(outI64, initI64);
+        Value outRow64 = makeChecksumI64(outCmpI64, /*dimToReduce=*/1);
+        Value outCol64 = makeChecksumI64(outCmpI64, /*dimToReduce=*/0);
+
+        auto f32Ty = bAfter.getF32Type();
+        auto i32Ty = bAfter.getI32Type();
+        SmallVector<Type, 1> i32Types = {i32Ty};
+        Value rowDeltaI32 =
+          bAfter
+            .create<func::CallOp>(loc, StringRef("vector_max_abs_diff_i64_i32"),
+                        TypeRange(i32Types),
+                        ValueRange{expRow64, outRow64})
+            .getResult(0);
+        Value colDeltaI32 =
+          bAfter
+            .create<func::CallOp>(loc, StringRef("vector_max_abs_diff_i64_i32"),
+                        TypeRange(i32Types),
+                        ValueRange{expCol64, outCol64})
+            .getResult(0);
+        Value rowExpMaxI32 =
+          bAfter
+            .create<func::CallOp>(loc, StringRef("vector_max_abs_i64_i32"),
+                        TypeRange(i32Types), ValueRange{expRow64})
+            .getResult(0);
+        Value rowCalcMaxI32 =
+          bAfter
+            .create<func::CallOp>(loc, StringRef("vector_max_abs_i64_i32"),
+                        TypeRange(i32Types), ValueRange{outRow64})
+            .getResult(0);
+        Value colExpMaxI32 =
+          bAfter
+            .create<func::CallOp>(loc, StringRef("vector_max_abs_i64_i32"),
+                        TypeRange(i32Types), ValueRange{expCol64})
+            .getResult(0);
+        Value colCalcMaxI32 =
+          bAfter
+            .create<func::CallOp>(loc, StringRef("vector_max_abs_i64_i32"),
+                        TypeRange(i32Types), ValueRange{outCol64})
+            .getResult(0);
+
+        Value rowDelta = bAfter.create<arith::SIToFPOp>(loc, f32Ty, rowDeltaI32);
+        Value colDelta = bAfter.create<arith::SIToFPOp>(loc, f32Ty, colDeltaI32);
+        Value rowExpMax = bAfter.create<arith::SIToFPOp>(loc, f32Ty, rowExpMaxI32);
+        Value rowCalcMax = bAfter.create<arith::SIToFPOp>(loc, f32Ty, rowCalcMaxI32);
+        Value colExpMax = bAfter.create<arith::SIToFPOp>(loc, f32Ty, colExpMaxI32);
+        Value colCalcMax = bAfter.create<arith::SIToFPOp>(loc, f32Ty, colCalcMaxI32);
+
+
+
+        Value layerConst = bAfter.create<arith::ConstantOp>(
+          loc, bAfter.getF32Type(),
+          bAfter.getF32FloatAttr(static_cast<float>(currentLayer)));
+        if (abftEnableAnalysisLog) {
+          bAfter.create<func::CallOp>(
+            loc, StringRef("abft_analysis.abft_log_rowcol_delta"), TypeRange{},
+            ValueRange{layerConst, rowDelta, colDelta});
+          if (logRowColDebugFn) {
+            bAfter.create<func::CallOp>(
+              loc, StringRef("abft_analysis.abft_log_rowcol_debug"), TypeRange{},
+              ValueRange{layerConst, rowExpMax, rowCalcMax, colExpMax,
+                   colCalcMax});
+          }
+        }
+        op->emitRemark() << "abft-qmatmul: inserted algorithmic checksum verification";
+        continue;
+        }
+
+      // Integer matmul path (e.g., int8/int8->int32 after
+      // iree-global-opt-quantized-matmul-to-matmul lowering).
+      if (targetName == "linalg.matmul") {
+        auto matmul = dyn_cast<linalg::MatmulOp>(op);
+          if (!matmul || !vecMaxI64I32Fn || !vecMaxAbsI64I32Fn ||
+              (abftEnableAnalysisLog && !logRowColDeltaFn) ||
+            op->getNumResults() == 0) {
+          op->emitRemark() << "abft-int-matmul: missing helper(s), skipping";
           continue;
         }
         auto outTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
         if (!outTy || !outTy.getElementType().isInteger(32)) {
-          op->emitRemark() << "abft-qconv: unsupported output type; expected ranked tensor<i32>";
-          continue;
-        }
-        OpBuilder b(op);
-        Location loc = op->getLoc();
-        Value refOut = op->getResult(0);
+          // Let float path below handle f32 matmul.
+          op->emitRemark()
+              << "abft-int-matmul: output not i32, deferring to other paths";
+        } else {
+          Location loc = op->getLoc();
+          Block::iterator nextIt = std::next(Block::iterator(op));
+          OpBuilder bAfter(op->getBlock(), nextIt);
 
-        auto flattenToVecI32 = [&](OpBuilder &builder, Value tensorVal) -> Value {
-          auto rTy = dyn_cast<RankedTensorType>(tensorVal.getType());
-          if (!rTy) return Value();
-          if (rTy.getRank() == 1) return tensorVal;
-          SmallVector<ReassociationIndices, 1> reassoc(1);
-          for (int64_t i = 0; i < rTy.getRank(); ++i) reassoc[0].push_back(i);
-          auto collapsed =
-              builder.create<tensor::CollapseShapeOp>(loc, tensorVal, reassoc).getResult();
-          auto vecDynI32 =
-              RankedTensorType::get({ShapedType::kDynamic}, builder.getI32Type());
-          if (collapsed.getType() != vecDynI32) {
-            collapsed = builder.create<tensor::CastOp>(loc, vecDynI32, collapsed).getResult();
-          }
-          return collapsed;
-        };
+          auto dyn2dI32 = RankedTensorType::get(
+              {ShapedType::kDynamic, ShapedType::kDynamic}, bAfter.getI32Type());
+          auto toI32 = [&](Value v) -> Value {
+            auto ty = dyn_cast<RankedTensorType>(v.getType());
+            if (!ty || ty.getRank() != 2)
+              return Value();
+            if (ty.getElementType().isInteger(32)) {
+              return ty == dyn2dI32
+                         ? v
+                         : bAfter.create<tensor::CastOp>(loc, dyn2dI32, v)
+                               .getResult();
+            }
+            if (!isa<IntegerType>(ty.getElementType()))
+              return Value();
+            Value c0 = bAfter.create<arith::ConstantIndexOp>(loc, 0);
+            Value c1 = bAfter.create<arith::ConstantIndexOp>(loc, 1);
+            Value m = bAfter.create<tensor::DimOp>(loc, v, c0);
+            Value n = bAfter.create<tensor::DimOp>(loc, v, c1);
+            Value empty =
+                bAfter
+                    .create<tensor::EmptyOp>(loc, TypeRange{dyn2dI32},
+                                             ValueRange{m, n})
+                    .getResult();
+            Value z = bAfter.create<arith::ConstantIntOp>(loc, 0, 32);
+            Value init = bAfter
+                             .create<linalg::FillOp>(loc, ValueRange{z},
+                                                     ValueRange{empty})
+                             .getResult(0);
+            return bAfter
+                .create<linalg::GenericOp>(
+                    loc, TypeRange{dyn2dI32}, ValueRange{v}, ValueRange{init},
+                    SmallVector<AffineMap>{
+                        AffineMap::getMultiDimIdentityMap(2, bAfter.getContext()),
+                        AffineMap::getMultiDimIdentityMap(2, bAfter.getContext())},
+                    SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
+                                                     utils::IteratorType::parallel},
+                    [&](OpBuilder &nb, Location nloc, ValueRange args) {
+                      Value ex =
+                          nb.create<arith::ExtSIOp>(nloc, nb.getI32Type(), args[0]);
+                      nb.create<linalg::YieldOp>(nloc, ex);
+                    })
+                .getResult(0);
+          };
 
-        Block::iterator nextIt = std::next(Block::iterator(op));
-        OpBuilder bAfter(op->getBlock(), nextIt);
+                Value lhsI32 = toI32(op->getOperand(0));
+                Value rhsI32 = toI32(op->getOperand(1));
 
-          Value refFlat = flattenToVecI32(bAfter, refOut);
-          Value dupFlat = flattenToVecI32(bAfter, refOut);
-          if (!refFlat || !dupFlat) {
-            op->emitRemark() << "abft-qconv: failed to flatten outputs";
+                Value outI32 = toI32(op->getResult(0));
+                if (!lhsI32 || !rhsI32 || !outI32) {
+                op->emitRemark() << "abft-int-matmul: failed i32 conversion for outputs";
             continue;
           }
-        if (abftInjectFault) {
-          StringRef pattern = abftInjectFaultPattern.getValue();
-          auto c0 = bAfter.create<arith::ConstantIndexOp>(loc, 0);
-          auto deltaVal = bAfter.create<arith::ConstantIntOp>(
-              loc, abftInjectFaultDelta, /*width=*/32);
-          if (pattern == "single_point") {
-            Value n = bAfter.create<tensor::DimOp>(loc, dupFlat, c0);
-            auto vecTy = RankedTensorType::get({ShapedType::kDynamic},
-                                               bAfter.getI32Type());
-            Value empty = bAfter.create<tensor::EmptyOp>(
-                loc, TypeRange{vecTy}, ValueRange{n});
-            Value zero = bAfter.create<arith::ConstantIntOp>(loc, 0, 32);
-            Value init = bAfter
-                             .create<linalg::FillOp>(loc, ValueRange{zero},
-                                                     ValueRange{empty})
+                Value lhsForChecksI32 = lhsI32;
+
+                Value initI32 = (op->getNumOperands() > 2) ? toI32(op->getOperand(2)) : Value();
+
+                if (abftInjectFault) {
+                StringRef pattern = abftInjectFaultPattern.getValue();
+                StringRef injectFn = "apply_fault_i32_single_point";
+                if (pattern == "trivial") {
+                  injectFn = "apply_fault_i32_trivial";
+                } else if (pattern == "checkered") {
+                  injectFn = "apply_fault_i32_checkered";
+                }
+                auto injectSym = module.lookupSymbol<func::FuncOp>(injectFn);
+                if (injectSym) {
+                  SmallVector<Type, 1> injTypes;
+                  for (Type t : injectSym.getFunctionType().getResults())
+                  injTypes.push_back(t);
+                  Value injArg = outI32;
+                  Type expectedIn = injectSym.getFunctionType().getInput(0);
+                  if (injArg.getType() != expectedIn) {
+                  auto inTy = dyn_cast<RankedTensorType>(injArg.getType());
+                  auto expTy = dyn_cast<RankedTensorType>(expectedIn);
+                  if (inTy && expTy && inTy.getRank() == expTy.getRank()) {
+                    injArg = bAfter.create<tensor::CastOp>(loc, expectedIn, injArg).getResult();
+                  } else {
+                    op->emitRemark()
+                      << "abft-int-matmul: pattern injection rank mismatch, skipping fault injection";
+                    injectSym = {};
+                  }
+                  }
+                  if (injectSym) {
+                  auto deltaVal = bAfter.create<arith::ConstantIntOp>(
+                    loc, abftInjectFaultDelta, /*width=*/32);
+                  Value injected = bAfter
+                             .create<func::CallOp>(
+                               loc, injectFn, TypeRange(injTypes),
+                               ValueRange{injArg, deltaVal.getResult()})
                              .getResult(0);
-            dupFlat = bAfter
-                          .create<linalg::GenericOp>(
-                              loc, TypeRange{vecTy}, ValueRange{dupFlat},
-                              ValueRange{init},
-                              SmallVector<AffineMap>{
-                                  AffineMap::getMultiDimIdentityMap(
-                                      1, bAfter.getContext()),
-                                  AffineMap::getMultiDimIdentityMap(
-                                      1, bAfter.getContext())},
-                              SmallVector<utils::IteratorType>{
-                                  utils::IteratorType::parallel},
-                              [&](OpBuilder &nestedBuilder, Location nestedLoc,
-                                  ValueRange args) {
-                                Value v = nestedBuilder.create<arith::AddIOp>(
-                                    nestedLoc, args[0], deltaVal);
-                                nestedBuilder.create<linalg::YieldOp>(nestedLoc,
-                                                                      v);
-                              })
-                          .getResult(0);
-            op->emitRemark() << "abft-qconv: injected single_point fault";
-          } else if (pattern == "checkered") {
-            Value n = bAfter.create<tensor::DimOp>(loc, dupFlat, c0);
-            auto vecTy = RankedTensorType::get({ShapedType::kDynamic},
-                                               bAfter.getI32Type());
-            Value empty = bAfter.create<tensor::EmptyOp>(
-                loc, TypeRange{vecTy}, ValueRange{n});
-            Value zero = bAfter.create<arith::ConstantIntOp>(loc, 0, 32);
-            Value init = bAfter
-                             .create<linalg::FillOp>(loc, ValueRange{zero},
-                                                     ValueRange{empty})
-                             .getResult(0);
-            dupFlat = bAfter
-                          .create<linalg::GenericOp>(
-                              loc, TypeRange{vecTy}, ValueRange{dupFlat},
-                              ValueRange{init},
-                              SmallVector<AffineMap>{
-                                  AffineMap::getMultiDimIdentityMap(
-                                      1, bAfter.getContext()),
-                                  AffineMap::getMultiDimIdentityMap(
-                                      1, bAfter.getContext())},
-                              SmallVector<utils::IteratorType>{
-                                  utils::IteratorType::parallel},
-                              [&](OpBuilder &nestedBuilder, Location nestedLoc,
-                                  ValueRange args) {
-                                Value i = nestedBuilder.create<linalg::IndexOp>(
-                                    nestedLoc, 0);
-                                Value two = nestedBuilder.create<arith::ConstantIndexOp>(
-                                    nestedLoc, 2);
-                                Value imod = nestedBuilder.create<arith::RemUIOp>(
-                                    nestedLoc, i, two);
-                                Value isEven = nestedBuilder.create<arith::CmpIOp>(
-                                    nestedLoc, arith::CmpIPredicate::eq, imod,
-                                    nestedBuilder.create<arith::ConstantIndexOp>(
-                                        nestedLoc, 0));
-                                Value neg = nestedBuilder.create<arith::SubIOp>(
-                                    nestedLoc,
-                                    nestedBuilder.create<arith::ConstantIntOp>(
-                                        nestedLoc, 0, 32),
-                                    deltaVal);
-                                Value d = nestedBuilder.create<arith::SelectOp>(
-                                    nestedLoc, isEven, deltaVal, neg);
-                                Value v = nestedBuilder.create<arith::AddIOp>(
-                                    nestedLoc, args[0], d);
-                                nestedBuilder.create<linalg::YieldOp>(nestedLoc,
-                                                                      v);
-                              })
-                          .getResult(0);
-            op->emitRemark() << "abft-qconv: injected checkered proxy fault";
-          } else {
-            op->emitRemark()
-                << "abft-qconv: trivial fault is checksum-balanced; leaving output unchanged";
+                  if (injected.getType() != outI32.getType()) {
+                    injected =
+                      bAfter.create<tensor::CastOp>(loc, outI32.getType(), injected).getResult();
+                  }
+                  outI32 = injected;
+                  op->emitRemark() << "abft-int-matmul: injected " << pattern << " fault";
+                  }
+                }
+                }
+
+                Value c0 = bAfter.create<arith::ConstantIndexOp>(loc, 0);
+                Value c1 = bAfter.create<arith::ConstantIndexOp>(loc, 1);
+                Value z32 = bAfter.create<arith::ConstantIntOp>(loc, 0, 32);
+                Value z64 = bAfter.create<arith::ConstantIntOp>(loc, 0, 64);
+
+                Value outCmpI32 = outI32;
+
+                auto dyn2dI64 = RankedTensorType::get(
+                    {ShapedType::kDynamic, ShapedType::kDynamic},
+                    bAfter.getI64Type());
+                auto vecDynI64 = RankedTensorType::get(
+                    {ShapedType::kDynamic}, bAfter.getI64Type());
+                auto castMatI32ToI64 = [&](Value mI32) -> Value {
+                  Value m = bAfter.create<tensor::DimOp>(loc, mI32, c0);
+                  Value n = bAfter.create<tensor::DimOp>(loc, mI32, c1);
+                  Value empty = bAfter.create<tensor::EmptyOp>(
+                      loc, TypeRange{dyn2dI64}, ValueRange{m, n}).getResult();
+                  Value init = bAfter.create<linalg::FillOp>(
+                      loc, ValueRange{z64}, ValueRange{empty}).getResult(0);
+                  return bAfter.create<linalg::GenericOp>(
+                                   loc, TypeRange{dyn2dI64}, ValueRange{mI32},
+                                   ValueRange{init},
+                                   SmallVector<AffineMap>{
+                                       AffineMap::getMultiDimIdentityMap(
+                                           2, bAfter.getContext()),
+                                       AffineMap::getMultiDimIdentityMap(
+                                           2, bAfter.getContext())},
+                                   SmallVector<utils::IteratorType>{
+                                       utils::IteratorType::parallel,
+                                       utils::IteratorType::parallel},
+                                   [&](OpBuilder &nb, Location nloc,
+                                       ValueRange args) {
+                                     Value ex = nb.create<arith::ExtSIOp>(
+                                         nloc, nb.getI64Type(), args[0]);
+                                     nb.create<linalg::YieldOp>(nloc, ex);
+                                   })
+                      .getResult(0);
+                };
+                auto makeChecksumI64 = [&](Value in, int64_t dimToReduce) -> Value {
+                  Value outLen =
+                      (dimToReduce == 0)
+                          ? bAfter.create<tensor::DimOp>(loc, in, c1).getResult()
+                          : bAfter.create<tensor::DimOp>(loc, in, c0).getResult();
+                  Value empty = bAfter.create<tensor::EmptyOp>(
+                      loc, TypeRange{vecDynI64}, ValueRange{outLen}).getResult();
+                  Value init = bAfter.create<linalg::FillOp>(
+                      loc, ValueRange{z64}, ValueRange{empty}).getResult(0);
+                  return bAfter
+                      .create<linalg::ReduceOp>(
+                          loc, ValueRange{in}, ValueRange{init},
+                          ArrayRef<int64_t>{dimToReduce},
+                          [&](OpBuilder &nb, Location nloc, ValueRange args) {
+                            nb.create<linalg::YieldOp>(
+                                nloc,
+                                nb.create<arith::AddIOp>(nloc, args[0], args[1])
+                                    .getResult());
+                          })
+                      .getResult(0);
+                };
+
+                Value lhsI64 = castMatI32ToI64(lhsForChecksI32);
+                Value rhsI64 = castMatI32ToI64(rhsI32);
+                Value outCmpI64 = castMatI32ToI64(outCmpI32);
+
+                Value outRow64 = makeChecksumI64(outCmpI64, /*dimToReduce=*/1);
+                Value outCol64 = makeChecksumI64(outCmpI64, /*dimToReduce=*/0);
+
+                Value mDim = bAfter.create<tensor::DimOp>(loc, outCmpI32, c0);
+                Value nDim = bAfter.create<tensor::DimOp>(loc, outCmpI32, c1);
+                Value z32tensor = bAfter.create<arith::ConstantIntOp>(loc, 0, 32);
+                Value eMxNI32 = bAfter.create<tensor::EmptyOp>(
+                  loc, TypeRange{dyn2dI32}, ValueRange{mDim, nDim}).getResult();
+                Value iMxNI32 = bAfter.create<linalg::FillOp>(
+                  loc, ValueRange{z32tensor}, ValueRange{eMxNI32}).getResult(0);
+                Value expCoreI32 = bAfter.create<linalg::MatmulOp>(
+                  loc, TypeRange{dyn2dI32}, ValueRange{lhsForChecksI32, rhsI32},
+                  ValueRange{iMxNI32}).getResult(0);
+                Value expFullI32 = expCoreI32;
+                if (initI32) {
+                  Value eSumI32 = bAfter.create<tensor::EmptyOp>(
+                    loc, TypeRange{dyn2dI32}, ValueRange{mDim, nDim}).getResult();
+                  Value iSumI32 = bAfter.create<linalg::FillOp>(
+                    loc, ValueRange{z32tensor}, ValueRange{eSumI32}).getResult(0);
+                  expFullI32 = bAfter.create<linalg::AddOp>(
+                    loc, TypeRange{dyn2dI32}, ValueRange{expCoreI32, initI32},
+                    ValueRange{iSumI32}).getResult(0);
+                }
+                Value expFull64 = castMatI32ToI64(expFullI32);
+                Value expRow64 = makeChecksumI64(expFull64, /*dimToReduce=*/1);
+                Value expCol64 = makeChecksumI64(expFull64, /*dimToReduce=*/0);
+
+                auto subVecFromVecI64 = [&](Value lhsV, Value rhsV) -> Value {
+                  Value len = bAfter.create<tensor::DimOp>(loc, lhsV, c0);
+                  Value empty = bAfter.create<tensor::EmptyOp>(
+                    loc, TypeRange{RankedTensorType::get({ShapedType::kDynamic}, bAfter.getI64Type())},
+                    ValueRange{len}).getResult();
+                  Value init = bAfter.create<linalg::FillOp>(
+                    loc, ValueRange{z64}, ValueRange{empty}).getResult(0);
+                  return bAfter
+                    .create<linalg::GenericOp>(
+                      loc,
+                      TypeRange{RankedTensorType::get({ShapedType::kDynamic}, bAfter.getI64Type())},
+                      ValueRange{lhsV, rhsV}, ValueRange{init},
+                      SmallVector<AffineMap>{
+                        AffineMap::getMultiDimIdentityMap(1, bAfter.getContext()),
+                        AffineMap::getMultiDimIdentityMap(1, bAfter.getContext()),
+                        AffineMap::getMultiDimIdentityMap(1, bAfter.getContext())},
+                      SmallVector<utils::IteratorType>{utils::IteratorType::parallel},
+                      [&](OpBuilder &nb, Location nloc, ValueRange args) {
+                      Value d =
+                        nb.create<arith::SubIOp>(nloc, args[0], args[1]).getResult();
+                      nb.create<linalg::YieldOp>(nloc, d);
+                      })
+                    .getResult(0);
+                };
+
+                Value layerConst = bAfter.create<arith::ConstantOp>(
+                    loc, bAfter.getF32Type(),
+                    bAfter.getF32FloatAttr(static_cast<float>(currentLayer)));
+
+                auto emitPerElementDeltas = [&](Value diffVec, bool isRowAxis) {
+                  Value len = bAfter.create<tensor::DimOp>(loc, diffVec, c0);
+                  Value empty = bAfter.create<tensor::EmptyOp>(
+                      loc, TypeRange{vecDynI64}, ValueRange{len}).getResult();
+                  Value init = bAfter.create<linalg::FillOp>(
+                      loc, ValueRange{z64}, ValueRange{empty}).getResult(0);
+                  (void)bAfter.create<linalg::GenericOp>(
+                      loc, TypeRange{vecDynI64}, ValueRange{diffVec},
+                      ValueRange{init},
+                      SmallVector<AffineMap>{
+                          AffineMap::getMultiDimIdentityMap(1, bAfter.getContext()),
+                          AffineMap::getMultiDimIdentityMap(1, bAfter.getContext())},
+                      SmallVector<utils::IteratorType>{utils::IteratorType::parallel},
+                      [&](OpBuilder &nb, Location nloc, ValueRange args) {
+                        Value elem = args[0];
+                        Value zeroI64 = nb.create<arith::ConstantIntOp>(nloc, 0, 64);
+                        Value isNeg = nb.create<arith::CmpIOp>(
+                            nloc, arith::CmpIPredicate::slt, elem, zeroI64);
+                        Value neg = nb.create<arith::SubIOp>(nloc, zeroI64, elem).getResult();
+                        Value abs = nb.create<arith::SelectOp>(nloc, isNeg, neg, elem).getResult();
+                        Value absF32 = nb.create<arith::SIToFPOp>(nloc, nb.getF32Type(), abs);
+                        Value zeroF32 = nb.create<arith::ConstantOp>(
+                            nloc, nb.getF32Type(), nb.getF32FloatAttr(0.0f));
+                        if (isRowAxis) {
+                          nb.create<func::CallOp>(
+                              nloc, StringRef("abft_analysis.abft_log_rowcol_delta"),
+                              TypeRange{}, ValueRange{layerConst, absF32, zeroF32});
+                        } else {
+                          nb.create<func::CallOp>(
+                              nloc, StringRef("abft_analysis.abft_log_rowcol_delta"),
+                              TypeRange{}, ValueRange{layerConst, zeroF32, absF32});
+                        }
+                        nb.create<linalg::YieldOp>(nloc, elem);
+                      });
+                };
+
+                Value rowDiff64 = subVecFromVecI64(expRow64, outRow64);
+                Value colDiff64 = subVecFromVecI64(expCol64, outCol64);
+                if (abftEnableAnalysisLog) {
+                  emitPerElementDeltas(rowDiff64, /*isRowAxis=*/true);
+                  emitPerElementDeltas(colDiff64, /*isRowAxis=*/false);
+                }
+
+                auto i32Ty = bAfter.getI32Type();
+                SmallVector<Type, 1> i32Types = {i32Ty};
+                Value rowDeltaI32 = bAfter
+                    .create<func::CallOp>(
+                        loc, StringRef("vector_max_abs_diff_i64_i32"),
+                        TypeRange(i32Types), ValueRange{expRow64, outRow64})
+                    .getResult(0);
+                Value colDeltaI32 = bAfter
+                    .create<func::CallOp>(
+                        loc, StringRef("vector_max_abs_diff_i64_i32"),
+                        TypeRange(i32Types), ValueRange{expCol64, outCol64})
+                    .getResult(0);
+                Value rowExpMaxI32 = bAfter
+                    .create<func::CallOp>(loc, StringRef("vector_max_abs_i64_i32"),
+                                          TypeRange(i32Types),
+                                          ValueRange{expRow64})
+                    .getResult(0);
+                Value rowCalcMaxI32 = bAfter
+                    .create<func::CallOp>(loc, StringRef("vector_max_abs_i64_i32"),
+                                          TypeRange(i32Types),
+                                          ValueRange{outRow64})
+                    .getResult(0);
+                Value colExpMaxI32 = bAfter
+                    .create<func::CallOp>(loc, StringRef("vector_max_abs_i64_i32"),
+                                          TypeRange(i32Types),
+                                          ValueRange{expCol64})
+                    .getResult(0);
+                Value colCalcMaxI32 = bAfter
+                    .create<func::CallOp>(loc, StringRef("vector_max_abs_i64_i32"),
+                                          TypeRange(i32Types),
+                                          ValueRange{outCol64})
+                    .getResult(0);
+                Value rowDelta = bAfter.create<arith::SIToFPOp>(
+                    loc, bAfter.getF32Type(), rowDeltaI32);
+                Value colDelta = bAfter.create<arith::SIToFPOp>(
+                    loc, bAfter.getF32Type(), colDeltaI32);
+                Value rowExpMax = bAfter.create<arith::SIToFPOp>(
+                    loc, bAfter.getF32Type(), rowExpMaxI32);
+                Value rowCalcMax = bAfter.create<arith::SIToFPOp>(
+                    loc, bAfter.getF32Type(), rowCalcMaxI32);
+                Value colExpMax = bAfter.create<arith::SIToFPOp>(
+                    loc, bAfter.getF32Type(), colExpMaxI32);
+                Value colCalcMax = bAfter.create<arith::SIToFPOp>(
+                    loc, bAfter.getF32Type(), colCalcMaxI32);
+
+
+
+          if (abftEnableAnalysisLog) {
+            bAfter.create<func::CallOp>(
+                loc, StringRef("abft_analysis.abft_log_rowcol_delta"), TypeRange{},
+                    ValueRange{layerConst, rowDelta, colDelta});
+            bAfter.create<func::CallOp>(
+                loc, StringRef("abft_analysis.abft_log_rowcol_debug"), TypeRange{},
+                ValueRange{layerConst, rowExpMax, rowCalcMax, colExpMax,
+                           colCalcMax});
           }
+          op->emitRemark()
+                  << "abft-int-matmul: inserted algorithmic checksum verification";
+          continue;
         }
-
-        SmallVector<Type, 1> maxTypes;
-        for (Type t : vecMaxI32Fn.getFunctionType().getResults()) maxTypes.push_back(t);
-        // Always compute the actual delta between original and injected outputs.
-        auto maxCall = bAfter.create<func::CallOp>(
-            loc, StringRef("vector_max_abs_diff_i32"), TypeRange(maxTypes),
-            ValueRange{refFlat, dupFlat});
-        Value delta = maxCall.getResult(0);
-
-        auto layerConst = bAfter.create<arith::ConstantOp>(
-            loc, bAfter.getF32Type(),
-            bAfter.getF32FloatAttr(static_cast<float>(currentLayer)));
-        bAfter.create<func::CallOp>(
-            loc, StringRef("abft_analysis.abft_log_rowcol_delta"), TypeRange{},
-            ValueRange{layerConst.getResult(), delta, delta});
-        op->emitRemark() << "abft-qconv: inserted duplicate-check delta logging";
-        continue;
       }
 
       op->emitRemark() << "abft-ones: matched matmul for ones*A insertion";
 
-      // Use the same duplicate+compare approach for FP32 matmul as for quantized matmul
-      // to avoid complex checksum algebra issues during downstream transformations.
-      if (!vecMaxFn || !logRowColDeltaFn || op->getNumResults() == 0) {
+      if (!vecMaxFn || !colFn || !rowFn || !matcolFn ||
+          (abftEnableAnalysisLog && !logRowColDeltaFn) ||
+          !rowvecFn || op->getNumResults() == 0) {
         op->emitRemark() << "abft: missing helper(s), skipping FP32 instrumentation";
         continue;
       }
@@ -1294,28 +1869,8 @@ module {
       Location loc = op->getLoc();
       Value refOut = op->getResult(0);
 
-      auto flattenToVecF32 = [&](OpBuilder &builder, Value tensorVal) -> Value {
-        auto rTy = dyn_cast<RankedTensorType>(tensorVal.getType());
-        if (!rTy) return Value();
-        if (rTy.getRank() == 1) return tensorVal;
-        SmallVector<ReassociationIndices, 1> reassoc(1);
-        for (int64_t i = 0; i < rTy.getRank(); ++i) reassoc[0].push_back(i);
-        auto collapsed =
-            builder.create<tensor::CollapseShapeOp>(loc, tensorVal, reassoc).getResult();
-        auto vecDynF32 = RankedTensorType::get({ShapedType::kDynamic}, builder.getF32Type());
-        if (collapsed.getType() != vecDynF32) {
-          collapsed = builder.create<tensor::CastOp>(loc, vecDynF32, collapsed).getResult();
-        }
-        return collapsed;
-      };
-
       Block::iterator nextIt = std::next(Block::iterator(op));
       OpBuilder bAfter(op->getBlock(), nextIt);
-      Value refFlat = flattenToVecF32(bAfter, refOut);
-      if (!refFlat) {
-        op->emitRemark() << "abft: failed to flatten F32 output";
-        continue;
-      }
 
       auto lhs = op->getOperand(0);
       auto rhs = op->getOperand(1);
@@ -1352,24 +1907,7 @@ module {
                             ValueRange{out2d, init2d})
                         .getResult(0);
       }
-      if (!colFn || !rowFn || !rowvecFn || !matcolFn || !vecMaxFn) {
-        op->emitRemark() << "abft: missing checksum helper(s), skipping FP32 instrumentation";
-        continue;
-      }
-      auto lhsCol = bAfter.create<func::CallOp>(
-          loc, StringRef("column_checksum"),
-          TypeRange{colFn.getFunctionType().getResult(0)}, ValueRange{lhs2d}).getResult(0);
-      auto rhsRow = bAfter.create<func::CallOp>(
-          loc, StringRef("row_checksum"),
-          TypeRange{rowFn.getFunctionType().getResult(0)}, ValueRange{rhs2d}).getResult(0);
-      auto expCol = bAfter.create<func::CallOp>(
-          loc, StringRef("rowvec_mul_mat"),
-          TypeRange{rowvecFn.getFunctionType().getResult(0)},
-          ValueRange{lhsCol, rhs2d}).getResult(0);
-      auto expRow = bAfter.create<func::CallOp>(
-          loc, StringRef("mat_mul_colvec"),
-          TypeRange{matcolFn.getFunctionType().getResult(0)},
-          ValueRange{lhs2d, rhsRow}).getResult(0);
+
       Value compareForChecks = compare2d;
       if (abftInjectFault) {
         StringRef pattern = abftInjectFaultPattern.getValue();
@@ -1399,10 +1937,10 @@ module {
                               .create<linalg::FillOp>(
                                   loc, ValueRange{zero}, ValueRange{empty})
                               .getResult(0);
-        compareForChecks =
+          compareForChecks =
             bAfter
                 .create<linalg::GenericOp>(
-                    loc, TypeRange{dyn2dTyF32}, ValueRange{compare2d},
+            loc, TypeRange{dyn2dTyF32}, ValueRange{compare2d},
                     ValueRange{initFault},
                     SmallVector<AffineMap>{
                         AffineMap::getMultiDimIdentityMap(2, bAfter.getContext()),
@@ -1459,67 +1997,49 @@ module {
                     })
                 .getResult(0);
       }
+
+            Value lhsCol = bAfter.create<func::CallOp>(
+              loc, StringRef("column_checksum"),
+              TypeRange{colFn.getFunctionType().getResult(0)},
+              ValueRange{lhs2d}).getResult(0);
+            Value rhsRow = bAfter.create<func::CallOp>(
+              loc, StringRef("row_checksum"),
+              TypeRange{rowFn.getFunctionType().getResult(0)},
+              ValueRange{rhs2d}).getResult(0);
       auto outCol = bAfter.create<func::CallOp>(
           loc, StringRef("column_checksum"),
           TypeRange{colFn.getFunctionType().getResult(0)},
-          ValueRange{compareForChecks}).getResult(0);
+              ValueRange{compareForChecks}).getResult(0);
       auto outRow = bAfter.create<func::CallOp>(
           loc, StringRef("row_checksum"),
           TypeRange{rowFn.getFunctionType().getResult(0)},
-          ValueRange{compareForChecks}).getResult(0);
+              ValueRange{compareForChecks}).getResult(0);
+
+            auto expRow = bAfter.create<func::CallOp>(
+              loc, StringRef("mat_mul_colvec"),
+                TypeRange{matcolFn.getFunctionType().getResult(0)},
+              ValueRange{lhs2d, rhsRow}).getResult(0);
+            auto expCol = bAfter.create<func::CallOp>(
+              loc, StringRef("rowvec_mul_mat"),
+                TypeRange{rowvecFn.getFunctionType().getResult(0)},
+              ValueRange{lhsCol, rhs2d}).getResult(0);
+
       SmallVector<Type, 1> maxTypes;
       for (Type t : vecMaxFn.getFunctionType().getResults()) maxTypes.push_back(t);
       auto rowDelta = bAfter.create<func::CallOp>(
           loc, StringRef("vector_max_abs_diff"), TypeRange(maxTypes),
-          ValueRange{expRow, outRow}).getResult(0);
+              ValueRange{outRow, expRow}).getResult(0);
       auto colDelta = bAfter.create<func::CallOp>(
           loc, StringRef("vector_max_abs_diff"), TypeRange(maxTypes),
-          ValueRange{expCol, outCol}).getResult(0);
-      Value delta = bAfter.create<arith::MaximumFOp>(loc, rowDelta, colDelta);
-      Value rowExpMax = rowDelta;
-      Value rowCalcMax = rowDelta;
-      Value colExpMax = colDelta;
-      Value colCalcMax = colDelta;
-      if (vecMaxPairFn && logRowColDebugFn) {
-        SmallVector<Type, 2> pairTypes;
-        for (Type t : vecMaxPairFn.getFunctionType().getResults())
-          pairTypes.push_back(t);
-        auto rowPair = bAfter.create<func::CallOp>(
-            loc, StringRef("vector_max_abs_diff_pair"), TypeRange(pairTypes),
-            ValueRange{expRow, outRow});
-        rowExpMax = rowPair.getResult(0);
-        rowCalcMax = rowPair.getResult(1);
-        auto colPair = bAfter.create<func::CallOp>(
-            loc, StringRef("vector_max_abs_diff_pair"), TypeRange(pairTypes),
-            ValueRange{expCol, outCol});
-        colExpMax = colPair.getResult(0);
-        colCalcMax = colPair.getResult(1);
-        // For explicit fault-injection runs, pair-derived scalar deltas are
-        // more robust on some FP edge cases.
-        // Only use pair-derived scalar deltas for injected non-trivial patterns.
-        // For trivial, we want checksum-cancel behavior (or no-op on small shapes)
-        // to remain close to zero.
-        if (abftInjectFault &&
-            abftInjectFaultPattern.getValue() != "trivial") {
-          rowDelta = bAfter.create<math::AbsFOp>(
-              loc, bAfter.create<arith::SubFOp>(loc, rowExpMax, rowCalcMax));
-          colDelta = bAfter.create<math::AbsFOp>(
-              loc, bAfter.create<arith::SubFOp>(loc, colExpMax, colCalcMax));
-          delta = bAfter.create<arith::MaximumFOp>(loc, rowDelta, colDelta);
-        }
-      }
+              ValueRange{outCol, expCol}).getResult(0);
 
       auto layerConst = bAfter.create<arith::ConstantOp>(
           loc, bAfter.getF32Type(),
           bAfter.getF32FloatAttr(static_cast<float>(currentLayer)));
-      bAfter.create<func::CallOp>(
-          loc, StringRef("abft_analysis.abft_log_rowcol_delta"), TypeRange{},
-          ValueRange{layerConst.getResult(), rowDelta, colDelta});
-      if (logRowColDebugFn) {
+      if (abftEnableAnalysisLog) {
         bAfter.create<func::CallOp>(
-            loc, StringRef("abft_analysis.abft_log_rowcol_debug"), TypeRange{},
-            ValueRange{layerConst.getResult(), rowExpMax, rowCalcMax, colExpMax,
-                       colCalcMax});
+            loc, StringRef("abft_analysis.abft_log_rowcol_delta"), TypeRange{},
+            ValueRange{layerConst.getResult(), rowDelta, colDelta});
       }
       op->emitRemark() << "abft: inserted FP32 checksum-based row/col delta logging";
     }

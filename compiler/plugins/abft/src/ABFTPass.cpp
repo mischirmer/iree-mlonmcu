@@ -20,6 +20,8 @@
 #include "mlir/Pass/Pass.h"
 // Command line option parsing for the standalone flag used by the pass.
 #include "llvm/Support/CommandLine.h"
+#include <regex>
+#include <string>
 
 using namespace mlir;
 
@@ -72,6 +74,92 @@ constexpr StringLiteral kAbftModeAttrName = "iree.abft.mode";
 constexpr StringLiteral kAbftModeNormal = "abft";
 constexpr StringLiteral kAbftModeScaled = "abyzft";
 
+struct ABFTSpecializeBatchDimPass
+    : public PassWrapper<ABFTSpecializeBatchDimPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ABFTSpecializeBatchDimPass)
+
+  StringRef getArgument() const final { return "abft-specialize-batch-dim"; }
+  StringRef getDescription() const final {
+    return "Specialize leading dynamic batch dims to 1 for ABFT preprocessing";
+  }
+
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<tensor::TensorDialect>();
+  }
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    std::string irText;
+    llvm::raw_string_ostream os(irText);
+    module.print(os);
+    os.flush();
+
+    // Specialize leading dynamic dim for rank>=2 tensors:
+    //   tensor<?xA...xT> -> tensor<1xA...xT>
+    irText = std::regex_replace(
+        irText, std::regex(R"(tensor<\?x([^>]*x[^>]+)>)"), "tensor<1x$1>");
+    // Specialize rank-1 vectors:
+    //   tensor<?xT> -> tensor<1xT>
+    irText = std::regex_replace(irText, std::regex(R"(tensor<\?x([^x>]+)>)"),
+                                "tensor<1x$1>");
+
+    auto rewriteConditional = [](const std::string &input,
+                                 const std::regex &pattern,
+                                 const std::function<std::string(
+                                     const std::smatch &)> &onMatch) {
+      std::string out;
+      out.reserve(input.size());
+      std::sregex_iterator it(input.begin(), input.end(), pattern);
+      std::sregex_iterator end;
+      size_t lastPos = 0;
+      for (; it != end; ++it) {
+        const auto &m = *it;
+        size_t pos = static_cast<size_t>(m.position());
+        out.append(input, lastPos, pos - lastPos);
+        out.append(onMatch(m));
+        lastPos = pos + static_cast<size_t>(m.length());
+      }
+      out.append(input, lastPos, std::string::npos);
+      return out;
+    };
+
+    // Keep tensor.empty dynamic-size operands consistent with now-static types
+    // before reparsing.
+    irText = rewriteConditional(
+        irText,
+        std::regex(R"(tensor\.empty\([^)]*\)\s*:\s*tensor<([^>]+)>)"),
+        [&](const std::smatch &m) {
+          std::string full = m.str(0);
+          std::string ty = m.str(1);
+          if (ty.find('?') != std::string::npos)
+            return full;
+          return std::string("tensor.empty() : tensor<") + ty + ">";
+        });
+    irText = rewriteConditional(
+        irText,
+        std::regex(
+            R"("tensor\.empty"\([^)]*\)\s*:\s*\([^)]*\)\s*->\s*tensor<([^>]+)>)"),
+        [&](const std::smatch &m) {
+          std::string full = m.str(0);
+          std::string ty = m.str(1);
+          if (ty.find('?') != std::string::npos)
+            return full;
+          return std::string("\"tensor.empty\"() : () -> tensor<") + ty + ">";
+        });
+
+    OwningOpRef<ModuleOp> reparsed =
+        parseSourceString<ModuleOp>(irText, module.getContext());
+    if (!reparsed) {
+      module.emitError(
+          "abft-specialize-batch-dim: failed to parse rewritten module text");
+      signalPassFailure();
+      return;
+    }
+
+    module.getBodyRegion().takeBody(reparsed->getBodyRegion());
+  }
+};
+
 struct ABFTPass : public PassWrapper<ABFTPass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ABFTPass)
 
@@ -118,7 +206,7 @@ struct ABFTPass : public PassWrapper<ABFTPass, OperationPass<func::FuncOp>> {
         funcName == "sample_row_scales_ones" ||
         funcName == "sample_col_scales" ||
         funcName == "sample_col_scales_ones" ||
-        funcName == "rowvec_mul_mat" || funcName == "mat_mul_colvec" ||
+        funcName == "rowvec_mul_mat_abft_v2" || funcName == "mat_mul_colvec_abft_v2" ||
         funcName == "vector_epsilon_compare_abft" ||
         funcName == "vector_max_abs_diff" ||
         funcName == "vector_max_abs_diff_i32" ||
@@ -431,60 +519,76 @@ module {
 
     // Full-checksum helper implementations (so the pass can emit full-checksum
     // calls unconditionally). These compute:
-    //  - rowvec_mul_mat(rv, mat) -> vector: for each column j, sum_k
+    //  - rowvec_mul_mat_abft_v2(rv, mat) -> vector: for each column j, sum_k
     //  rv[k]*mat[k,j]
-    //  - mat_mul_colvec(mat, cv) -> vector: for each row i, sum_j
+    //  - mat_mul_colvec_abft_v2(mat, cv) -> vector: for each row i, sum_j
     //  mat[i,j]*cv[j]
     //  - vector_epsilon_compare_abft(v1, v2, eps) -> () : elementwise report
     //  (|v1-v2| < eps)
-    func::FuncOp parsedRowVec = ensureFunctionWithBody("rowvec_mul_mat", R"mlir(
+    func::FuncOp parsedRowVec = ensureFunctionWithBody("rowvec_mul_mat_abft_v2", R"mlir(
 module {
-  func.func @rowvec_mul_mat(%rv: tensor<?xf32>, %mat: tensor<?x?xf32>) -> tensor<?xf32> {
+  func.func @rowvec_mul_mat_abft_v2(%rv: tensor<?xf32>, %mat: tensor<?x?xf32>) -> tensor<?xf32> {
+    %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
+    %mat_k = tensor.dim %mat, %c0 : tensor<?x?xf32>
     %n = tensor.dim %mat, %c1 : tensor<?x?xf32>
+    %rv_k = tensor.dim %rv, %c0 : tensor<?xf32>
+    %rv_is_scalar = arith.cmpi eq, %rv_k, %c1 : index
     %empty = tensor.empty(%n) : tensor<?xf32>
     %zero = arith.constant 0.0 : f32
     %init = linalg.fill ins(%zero : f32) outs(%empty : tensor<?xf32>) -> tensor<?xf32>
-    %res = linalg.generic {
-      indexing_maps = [
-        affine_map<(d0, d1) -> (d1)>,
-        affine_map<(d0, d1) -> (d1, d0)>,
-        affine_map<(d0, d1) -> (d0)>
-      ],
-      iterator_types = ["parallel", "reduction"]
-    } ins(%rv, %mat : tensor<?xf32>, tensor<?x?xf32>) outs(%init : tensor<?xf32>) {
-    ^bb0(%rv_elem: f32, %mat_elem: f32, %acc: f32):
-      %prod = arith.mulf %rv_elem, %mat_elem : f32
-      %sum = arith.addf %acc, %prod : f32
-      linalg.yield %sum : f32
-    } -> tensor<?xf32>
+    %res = scf.for %j = %c0 to %n step %c1 iter_args(%accv = %init) -> (tensor<?xf32>) {
+      %sum = scf.for %i = %c0 to %mat_k step %c1 iter_args(%acc = %zero) -> (f32) {
+        %rv_elem = scf.if %rv_is_scalar -> (f32) {
+          %x = tensor.extract %rv[%c0] : tensor<?xf32>
+          scf.yield %x : f32
+        } else {
+          %x = tensor.extract %rv[%i] : tensor<?xf32>
+          scf.yield %x : f32
+        }
+        %mat_elem = tensor.extract %mat[%i, %j] : tensor<?x?xf32>
+        %prod = arith.mulf %rv_elem, %mat_elem : f32
+        %next = arith.addf %acc, %prod : f32
+        scf.yield %next : f32
+      }
+      %nextv = tensor.insert %sum into %accv[%j] : tensor<?xf32>
+      scf.yield %nextv : tensor<?xf32>
+    }
     return %res : tensor<?xf32>
   }
 }
 )mlir");
     (void)parsedRowVec;
 
-    func::FuncOp parsedMatCol = ensureFunctionWithBody("mat_mul_colvec", R"mlir(
+    func::FuncOp parsedMatCol = ensureFunctionWithBody("mat_mul_colvec_abft_v2", R"mlir(
 module {
-  func.func @mat_mul_colvec(%mat: tensor<?x?xf32>, %cv: tensor<?xf32>) -> tensor<?xf32> {
+  func.func @mat_mul_colvec_abft_v2(%mat: tensor<?x?xf32>, %cv: tensor<?xf32>) -> tensor<?xf32> {
     %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
     %m = tensor.dim %mat, %c0 : tensor<?x?xf32>
+    %mat_k = tensor.dim %mat, %c1 : tensor<?x?xf32>
+    %cv_k = tensor.dim %cv, %c0 : tensor<?xf32>
+    %cv_is_scalar = arith.cmpi eq, %cv_k, %c1 : index
     %empty = tensor.empty(%m) : tensor<?xf32>
     %zero = arith.constant 0.0 : f32
     %init = linalg.fill ins(%zero : f32) outs(%empty : tensor<?xf32>) -> tensor<?xf32>
-    %res = linalg.generic {
-      indexing_maps = [
-        affine_map<(d0, d1) -> (d0, d1)>,
-        affine_map<(d0, d1) -> (d1)>,
-        affine_map<(d0, d1) -> (d0)>
-      ],
-      iterator_types = ["parallel", "reduction"]
-    } ins(%mat, %cv : tensor<?x?xf32>, tensor<?xf32>) outs(%init : tensor<?xf32>) {
-    ^bb0(%mat_elem: f32, %cv_elem: f32, %acc: f32):
-      %prod = arith.mulf %mat_elem, %cv_elem : f32
-      %sum = arith.addf %acc, %prod : f32
-      linalg.yield %sum : f32
-    } -> tensor<?xf32>
+    %res = scf.for %i = %c0 to %m step %c1 iter_args(%accv = %init) -> (tensor<?xf32>) {
+      %sum = scf.for %j = %c0 to %mat_k step %c1 iter_args(%acc = %zero) -> (f32) {
+        %cv_elem = scf.if %cv_is_scalar -> (f32) {
+          %x = tensor.extract %cv[%c0] : tensor<?xf32>
+          scf.yield %x : f32
+        } else {
+          %x = tensor.extract %cv[%j] : tensor<?xf32>
+          scf.yield %x : f32
+        }
+        %mat_elem = tensor.extract %mat[%i, %j] : tensor<?x?xf32>
+        %prod = arith.mulf %mat_elem, %cv_elem : f32
+        %next = arith.addf %acc, %prod : f32
+        scf.yield %next : f32
+      }
+      %nextv = tensor.insert %sum into %accv[%i] : tensor<?xf32>
+      scf.yield %nextv : tensor<?xf32>
+    }
     return %res : tensor<?xf32>
   }
 }
@@ -1007,9 +1111,9 @@ module {
     auto epsFn =
         module.lookupSymbol<func::FuncOp>(StringRef("epsilon_compare_abft"));
     auto rowvecFn =
-        module.lookupSymbol<func::FuncOp>(StringRef("rowvec_mul_mat"));
+        module.lookupSymbol<func::FuncOp>(StringRef("rowvec_mul_mat_abft_v2"));
     auto matcolFn =
-        module.lookupSymbol<func::FuncOp>(StringRef("mat_mul_colvec"));
+        module.lookupSymbol<func::FuncOp>(StringRef("mat_mul_colvec_abft_v2"));
     auto vecMaxFn =
         module.lookupSymbol<func::FuncOp>(StringRef("vector_max_abs_diff"));
     auto vecMaxI32Fn =
@@ -2027,11 +2131,11 @@ module {
               ValueRange{compareForChecks}).getResult(0);
 
             auto expRow = bAfter.create<func::CallOp>(
-              loc, StringRef("mat_mul_colvec"),
+              loc, StringRef("mat_mul_colvec_abft_v2"),
                 TypeRange{matcolFn.getFunctionType().getResult(0)},
               ValueRange{lhs2d, rhsRow}).getResult(0);
             auto expCol = bAfter.create<func::CallOp>(
-              loc, StringRef("rowvec_mul_mat"),
+              loc, StringRef("rowvec_mul_mat_abft_v2"),
                 TypeRange{rowvecFn.getFunctionType().getResult(0)},
               ValueRange{lhsCol, rhs2d}).getResult(0);
 
@@ -2062,4 +2166,8 @@ module {
 std::unique_ptr<mlir::Pass> createABFTPass() {
   return std::make_unique<ABFTPass>();
 }
+std::unique_ptr<mlir::Pass> createABFTSpecializeBatchDimPass() {
+  return std::make_unique<ABFTSpecializeBatchDimPass>();
+}
 static mlir::PassRegistration<ABFTPass> reg;
+static mlir::PassRegistration<ABFTSpecializeBatchDimPass> regBatch;

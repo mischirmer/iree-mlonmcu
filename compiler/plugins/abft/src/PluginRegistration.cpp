@@ -5,6 +5,7 @@
 
 // Factory from ABFTPass.cpp
 std::unique_ptr<mlir::Pass> createABFTPass();
+std::unique_ptr<mlir::Pass> createABFTSpecializeBatchDimPass();
 
 namespace mlir::iree_compiler::plugins::abft {
 
@@ -16,6 +17,7 @@ struct ABFTPassSession
   // pass safely introduce memref-based helper calls without tripping early
   // legality checks.
   void extendPreprocessingPassPipeline(OpPassManager &pm) override {
+    pm.addPass(createABFTSpecializeBatchDimPass());
     auto &funcPM = pm.nest<func::FuncOp>();
     funcPM.addPass(createABFTPass());
   }

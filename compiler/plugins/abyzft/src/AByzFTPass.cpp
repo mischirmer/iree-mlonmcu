@@ -24,6 +24,7 @@
 #include <limits>
 #include <algorithm>
 #include <functional>
+#include <regex>
 #include <vector>
 
 using namespace mlir;
@@ -261,6 +262,69 @@ static DenseElementsAttr buildSplatIntTensorAttr(RankedTensorType type,
   auto numElements = type.getNumElements();
   SmallVector<int64_t> values(numElements, value);
   return buildDenseIntTensorAttr(type, values);
+}
+
+static LogicalResult specializeLeadingBatchDimInModule(ModuleOp module) {
+  std::string irText;
+  llvm::raw_string_ostream os(irText);
+  module.print(os);
+  os.flush();
+
+  irText = std::regex_replace(
+      irText, std::regex(R"(tensor<\?x([^>]*x[^>]+)>)"), "tensor<1x$1>");
+  irText = std::regex_replace(irText, std::regex(R"(tensor<\?x([^x>]+)>)"),
+                              "tensor<1x$1>");
+
+  auto rewriteConditional = [](const std::string &input,
+                               const std::regex &pattern,
+                               const std::function<std::string(
+                                   const std::smatch &)> &onMatch) {
+    std::string out;
+    out.reserve(input.size());
+    std::sregex_iterator it(input.begin(), input.end(), pattern);
+    std::sregex_iterator end;
+    size_t lastPos = 0;
+    for (; it != end; ++it) {
+      const auto &m = *it;
+      size_t pos = static_cast<size_t>(m.position());
+      out.append(input, lastPos, pos - lastPos);
+      out.append(onMatch(m));
+      lastPos = pos + static_cast<size_t>(m.length());
+    }
+    out.append(input, lastPos, std::string::npos);
+    return out;
+  };
+
+  irText = rewriteConditional(
+      irText, std::regex(R"(tensor\.empty\([^)]*\)\s*:\s*tensor<([^>]+)>)"),
+      [&](const std::smatch &m) {
+        std::string full = m.str(0);
+        std::string ty = m.str(1);
+        if (ty.find('?') != std::string::npos)
+          return full;
+        return std::string("tensor.empty() : tensor<") + ty + ">";
+      });
+  irText = rewriteConditional(
+      irText,
+      std::regex(
+          R"("tensor\.empty"\([^)]*\)\s*:\s*\([^)]*\)\s*->\s*tensor<([^>]+)>)"),
+      [&](const std::smatch &m) {
+        std::string full = m.str(0);
+        std::string ty = m.str(1);
+        if (ty.find('?') != std::string::npos)
+          return full;
+        return std::string("\"tensor.empty\"() : () -> tensor<") + ty + ">";
+      });
+
+  OwningOpRef<ModuleOp> reparsed =
+      parseSourceString<ModuleOp>(irText, module.getContext());
+  if (!reparsed) {
+    module.emitError(
+        "batch specialization failed to parse rewritten module text");
+    return failure();
+  }
+  module.getBodyRegion().takeBody(reparsed->getBodyRegion());
+  return success();
 }
 
 static SmallVector<double> getDenseValues(DenseFPElementsAttr dense) {
@@ -856,6 +920,10 @@ struct AByzFTPass : public PassWrapper<AByzFTPass, OperationPass<ModuleOp>> {
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
+    if (failed(specializeLeadingBatchDimInModule(module))) {
+      signalPassFailure();
+      return;
+    }
     (void)abyzftInjectFaultPattern;
     if (auto modeAttr = module->getAttrOfType<StringAttr>(kAbftModeAttrName)) {
       if (modeAttr.getValue() != kAbftModeScaled) {
@@ -1093,14 +1161,24 @@ module {
   }
 }
 )mlir");
-    (void)ensureFunctionWithBody("rowvec_mul_mat", R"mlir(
+    (void)ensureFunctionWithBody("rowvec_mul_mat_abft_v2", R"mlir(
 module {
-  func.func @rowvec_mul_mat(%rv: tensor<?xf32>, %mat: tensor<?x?xf32>) -> tensor<?xf32> {
+  func.func @rowvec_mul_mat_abft_v2(%rv: tensor<?xf32>, %mat: tensor<?x?xf32>) -> tensor<?xf32> {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %k = tensor.dim %rv, %c0 : tensor<?xf32>
+    %rv_k = tensor.dim %rv, %c0 : tensor<?xf32>
+    %mat_k = tensor.dim %mat, %c0 : tensor<?x?xf32>
     %n = tensor.dim %mat, %c1 : tensor<?x?xf32>
-    %rv2d = tensor.expand_shape %rv [[0, 1]] output_shape [%c1, %k] : tensor<?xf32> into tensor<1x?xf32>
+    %rv_is_scalar = arith.cmpi eq, %rv_k, %c1 : index
+    %rv_norm = scf.if %rv_is_scalar -> (tensor<?xf32>) {
+      %emptyv = tensor.empty(%mat_k) : tensor<?xf32>
+      %s0 = tensor.extract %rv[%c0] : tensor<?xf32>
+      %filledv = linalg.fill ins(%s0 : f32) outs(%emptyv : tensor<?xf32>) -> tensor<?xf32>
+      scf.yield %filledv : tensor<?xf32>
+    } else {
+      scf.yield %rv : tensor<?xf32>
+    }
+    %rv2d = tensor.expand_shape %rv_norm [[0, 1]] output_shape [%c1, %mat_k] : tensor<?xf32> into tensor<1x?xf32>
     %empty2d = tensor.empty(%n) : tensor<1x?xf32>
     %zero = arith.constant 0.0 : f32
     %init2d = linalg.fill ins(%zero : f32) outs(%empty2d : tensor<1x?xf32>) -> tensor<1x?xf32>
@@ -1111,14 +1189,24 @@ module {
   }
 }
 )mlir");
-    (void)ensureFunctionWithBody("mat_mul_colvec", R"mlir(
+    (void)ensureFunctionWithBody("mat_mul_colvec_abft_v2", R"mlir(
 module {
-  func.func @mat_mul_colvec(%mat: tensor<?x?xf32>, %cv: tensor<?xf32>) -> tensor<?xf32> {
+  func.func @mat_mul_colvec_abft_v2(%mat: tensor<?x?xf32>, %cv: tensor<?xf32>) -> tensor<?xf32> {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %m = tensor.dim %mat, %c0 : tensor<?x?xf32>
-    %k = tensor.dim %cv, %c0 : tensor<?xf32>
-    %cv2d = tensor.expand_shape %cv [[0, 1]] output_shape [%k, %c1] : tensor<?xf32> into tensor<?x1xf32>
+    %cv_k = tensor.dim %cv, %c0 : tensor<?xf32>
+    %mat_k = tensor.dim %mat, %c1 : tensor<?x?xf32>
+    %cv_is_scalar = arith.cmpi eq, %cv_k, %c1 : index
+    %cv_norm = scf.if %cv_is_scalar -> (tensor<?xf32>) {
+      %emptyv = tensor.empty(%mat_k) : tensor<?xf32>
+      %s0 = tensor.extract %cv[%c0] : tensor<?xf32>
+      %filledv = linalg.fill ins(%s0 : f32) outs(%emptyv : tensor<?xf32>) -> tensor<?xf32>
+      scf.yield %filledv : tensor<?xf32>
+    } else {
+      scf.yield %cv : tensor<?xf32>
+    }
+    %cv2d = tensor.expand_shape %cv_norm [[0, 1]] output_shape [%mat_k, %c1] : tensor<?xf32> into tensor<?x1xf32>
     %empty2d = tensor.empty(%m) : tensor<?x1xf32>
     %zero = arith.constant 0.0 : f32
     %init2d = linalg.fill ins(%zero : f32) outs(%empty2d : tensor<?x1xf32>) -> tensor<?x1xf32>
@@ -1356,14 +1444,24 @@ module {
   }
 }
 )mlir");
-    (void)ensureFunctionWithBody("rowvec_mul_mat", R"mlir(
+    (void)ensureFunctionWithBody("rowvec_mul_mat_abft_v2", R"mlir(
 module {
-  func.func @rowvec_mul_mat(%rv: tensor<?xf32>, %mat: tensor<?x?xf32>) -> tensor<?xf32> {
+  func.func @rowvec_mul_mat_abft_v2(%rv: tensor<?xf32>, %mat: tensor<?x?xf32>) -> tensor<?xf32> {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %k = tensor.dim %rv, %c0 : tensor<?xf32>
+    %rv_k = tensor.dim %rv, %c0 : tensor<?xf32>
+    %mat_k = tensor.dim %mat, %c0 : tensor<?x?xf32>
     %n = tensor.dim %mat, %c1 : tensor<?x?xf32>
-    %rv2d = tensor.expand_shape %rv [[0, 1]] output_shape [%k] : tensor<?xf32> into tensor<1x?xf32>
+    %rv_is_scalar = arith.cmpi eq, %rv_k, %c1 : index
+    %rv_norm = scf.if %rv_is_scalar -> (tensor<?xf32>) {
+      %emptyv = tensor.empty(%mat_k) : tensor<?xf32>
+      %s0 = tensor.extract %rv[%c0] : tensor<?xf32>
+      %filledv = linalg.fill ins(%s0 : f32) outs(%emptyv : tensor<?xf32>) -> tensor<?xf32>
+      scf.yield %filledv : tensor<?xf32>
+    } else {
+      scf.yield %rv : tensor<?xf32>
+    }
+    %rv2d = tensor.expand_shape %rv_norm [[0, 1]] output_shape [%c1, %mat_k] : tensor<?xf32> into tensor<1x?xf32>
     %empty2d = tensor.empty(%n) : tensor<1x?xf32>
     %zero = arith.constant 0.0 : f32
     %init2d = linalg.fill ins(%zero : f32) outs(%empty2d : tensor<1x?xf32>) -> tensor<1x?xf32>
@@ -1374,14 +1472,24 @@ module {
   }
 }
 )mlir");
-    (void)ensureFunctionWithBody("mat_mul_colvec", R"mlir(
+    (void)ensureFunctionWithBody("mat_mul_colvec_abft_v2", R"mlir(
 module {
-  func.func @mat_mul_colvec(%mat: tensor<?x?xf32>, %cv: tensor<?xf32>) -> tensor<?xf32> {
+  func.func @mat_mul_colvec_abft_v2(%mat: tensor<?x?xf32>, %cv: tensor<?xf32>) -> tensor<?xf32> {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %m = tensor.dim %mat, %c0 : tensor<?x?xf32>
-    %k = tensor.dim %cv, %c0 : tensor<?xf32>
-    %cv2d = tensor.expand_shape %cv [[0, 1]] output_shape [%k] : tensor<?xf32> into tensor<?x1xf32>
+    %cv_k = tensor.dim %cv, %c0 : tensor<?xf32>
+    %mat_k = tensor.dim %mat, %c1 : tensor<?x?xf32>
+    %cv_is_scalar = arith.cmpi eq, %cv_k, %c1 : index
+    %cv_norm = scf.if %cv_is_scalar -> (tensor<?xf32>) {
+      %emptyv = tensor.empty(%mat_k) : tensor<?xf32>
+      %s0 = tensor.extract %cv[%c0] : tensor<?xf32>
+      %filledv = linalg.fill ins(%s0 : f32) outs(%emptyv : tensor<?xf32>) -> tensor<?xf32>
+      scf.yield %filledv : tensor<?xf32>
+    } else {
+      scf.yield %cv : tensor<?xf32>
+    }
+    %cv2d = tensor.expand_shape %cv_norm [[0, 1]] output_shape [%mat_k, %c1] : tensor<?xf32> into tensor<?x1xf32>
     %empty2d = tensor.empty(%m) : tensor<?x1xf32>
     %zero = arith.constant 0.0 : f32
     %init2d = linalg.fill ins(%zero : f32) outs(%empty2d : tensor<?x1xf32>) -> tensor<?x1xf32>
@@ -1756,11 +1864,11 @@ module {
     if (!module.lookupSymbol<func::FuncOp>("descale_matrix")) {
       maybeInsertDecl("descale_matrix", FunctionType::get(ctx, TypeRange{dyn2d, vecDyn, vecDyn}, TypeRange{dyn2d}));
     }
-    if (!module.lookupSymbol<func::FuncOp>("rowvec_mul_mat")) {
-      maybeInsertDecl("rowvec_mul_mat", FunctionType::get(ctx, TypeRange{vecDyn, dyn2d}, TypeRange{vecDyn}));
+    if (!module.lookupSymbol<func::FuncOp>("rowvec_mul_mat_abft_v2")) {
+      maybeInsertDecl("rowvec_mul_mat_abft_v2", FunctionType::get(ctx, TypeRange{vecDyn, dyn2d}, TypeRange{vecDyn}));
     }
-    if (!module.lookupSymbol<func::FuncOp>("mat_mul_colvec")) {
-      maybeInsertDecl("mat_mul_colvec", FunctionType::get(ctx, TypeRange{dyn2d, vecDyn}, TypeRange{vecDyn}));
+    if (!module.lookupSymbol<func::FuncOp>("mat_mul_colvec_abft_v2")) {
+      maybeInsertDecl("mat_mul_colvec_abft_v2", FunctionType::get(ctx, TypeRange{dyn2d, vecDyn}, TypeRange{vecDyn}));
     }
     if (!module.lookupSymbol<func::FuncOp>("vector_add")) {
       maybeInsertDecl("vector_add", FunctionType::get(ctx, TypeRange{vecDyn, vecDyn}, TypeRange{vecDyn}));
@@ -1806,8 +1914,8 @@ module {
              name == "abft_analysis.abft_log_rowcol_debug" ||
              name == "sample_row_scales" || name == "sample_col_scales" ||
              name == "scale_matrix_rows" || name == "scale_matrix_cols" ||
-             name == "descale_matrix" || name == "rowvec_mul_mat" ||
-             name == "mat_mul_colvec" || name == "vector_add" ||
+             name == "descale_matrix" || name == "rowvec_mul_mat_abft_v2" ||
+             name == "mat_mul_colvec_abft_v2" || name == "vector_add" ||
              name == "matrix_add" || name == "matrix_sub" ||
              name == "zero_matrix_like";
     };
@@ -2983,6 +3091,10 @@ struct FreivaldPass : public PassWrapper<FreivaldPass, OperationPass<ModuleOp>> 
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
+    if (failed(specializeLeadingBatchDimInModule(module))) {
+      signalPassFailure();
+      return;
+    }
     if (auto modeAttr = module->getAttrOfType<StringAttr>(kAbftModeAttrName)) {
       if (modeAttr.getValue() != kAbftModeFreivald) {
         module.emitError(
@@ -3252,14 +3364,24 @@ module {
   }
 }
 )mlir");
-    (void)ensureFunctionWithBody("rowvec_mul_mat", R"mlir(
+    (void)ensureFunctionWithBody("rowvec_mul_mat_abft_v2", R"mlir(
 module {
-  func.func @rowvec_mul_mat(%rv: tensor<?xf32>, %mat: tensor<?x?xf32>) -> tensor<?xf32> {
+  func.func @rowvec_mul_mat_abft_v2(%rv: tensor<?xf32>, %mat: tensor<?x?xf32>) -> tensor<?xf32> {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %k = tensor.dim %rv, %c0 : tensor<?xf32>
+    %rv_k = tensor.dim %rv, %c0 : tensor<?xf32>
+    %mat_k = tensor.dim %mat, %c0 : tensor<?x?xf32>
     %n = tensor.dim %mat, %c1 : tensor<?x?xf32>
-    %rv2d = tensor.expand_shape %rv [[0, 1]] output_shape [%k] : tensor<?xf32> into tensor<1x?xf32>
+    %rv_is_scalar = arith.cmpi eq, %rv_k, %c1 : index
+    %rv_norm = scf.if %rv_is_scalar -> (tensor<?xf32>) {
+      %emptyv = tensor.empty(%mat_k) : tensor<?xf32>
+      %s0 = tensor.extract %rv[%c0] : tensor<?xf32>
+      %filledv = linalg.fill ins(%s0 : f32) outs(%emptyv : tensor<?xf32>) -> tensor<?xf32>
+      scf.yield %filledv : tensor<?xf32>
+    } else {
+      scf.yield %rv : tensor<?xf32>
+    }
+    %rv2d = tensor.expand_shape %rv_norm [[0, 1]] output_shape [%c1, %mat_k] : tensor<?xf32> into tensor<1x?xf32>
     %empty2d = tensor.empty(%n) : tensor<1x?xf32>
     %zero = arith.constant 0.0 : f32
     %init2d = linalg.fill ins(%zero : f32) outs(%empty2d : tensor<1x?xf32>) -> tensor<1x?xf32>
@@ -3270,14 +3392,24 @@ module {
   }
 }
 )mlir");
-    (void)ensureFunctionWithBody("mat_mul_colvec", R"mlir(
+    (void)ensureFunctionWithBody("mat_mul_colvec_abft_v2", R"mlir(
 module {
-  func.func @mat_mul_colvec(%mat: tensor<?x?xf32>, %cv: tensor<?xf32>) -> tensor<?xf32> {
+  func.func @mat_mul_colvec_abft_v2(%mat: tensor<?x?xf32>, %cv: tensor<?xf32>) -> tensor<?xf32> {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %m = tensor.dim %mat, %c0 : tensor<?x?xf32>
-    %k = tensor.dim %cv, %c0 : tensor<?xf32>
-    %cv2d = tensor.expand_shape %cv [[0, 1]] output_shape [%k] : tensor<?xf32> into tensor<?x1xf32>
+    %cv_k = tensor.dim %cv, %c0 : tensor<?xf32>
+    %mat_k = tensor.dim %mat, %c1 : tensor<?x?xf32>
+    %cv_is_scalar = arith.cmpi eq, %cv_k, %c1 : index
+    %cv_norm = scf.if %cv_is_scalar -> (tensor<?xf32>) {
+      %emptyv = tensor.empty(%mat_k) : tensor<?xf32>
+      %s0 = tensor.extract %cv[%c0] : tensor<?xf32>
+      %filledv = linalg.fill ins(%s0 : f32) outs(%emptyv : tensor<?xf32>) -> tensor<?xf32>
+      scf.yield %filledv : tensor<?xf32>
+    } else {
+      scf.yield %cv : tensor<?xf32>
+    }
+    %cv2d = tensor.expand_shape %cv_norm [[0, 1]] output_shape [%mat_k, %c1] : tensor<?xf32> into tensor<?x1xf32>
     %empty2d = tensor.empty(%m) : tensor<?x1xf32>
     %zero = arith.constant 0.0 : f32
     %init2d = linalg.fill ins(%zero : f32) outs(%empty2d : tensor<?x1xf32>) -> tensor<?x1xf32>
@@ -3359,12 +3491,12 @@ module {
       maybeInsertDecl("sample_col_scales",
                       FunctionType::get(ctx, TypeRange{dyn2d}, TypeRange{vecDyn}));
     }
-    if (!module.lookupSymbol<func::FuncOp>("rowvec_mul_mat")) {
-      maybeInsertDecl("rowvec_mul_mat",
+    if (!module.lookupSymbol<func::FuncOp>("rowvec_mul_mat_abft_v2")) {
+      maybeInsertDecl("rowvec_mul_mat_abft_v2",
                       FunctionType::get(ctx, TypeRange{vecDyn, dyn2d}, TypeRange{vecDyn}));
     }
-    if (!module.lookupSymbol<func::FuncOp>("mat_mul_colvec")) {
-      maybeInsertDecl("mat_mul_colvec",
+    if (!module.lookupSymbol<func::FuncOp>("mat_mul_colvec_abft_v2")) {
+      maybeInsertDecl("mat_mul_colvec_abft_v2",
                       FunctionType::get(ctx, TypeRange{dyn2d, vecDyn}, TypeRange{vecDyn}));
     }
     if (!module.lookupSymbol<func::FuncOp>("vector_add")) {
@@ -3403,9 +3535,9 @@ module {
     auto sampleColFn =
         module.lookupSymbol<func::FuncOp>(StringRef("sample_col_scales"));
     auto rowvecFn =
-        module.lookupSymbol<func::FuncOp>(StringRef("rowvec_mul_mat"));
+        module.lookupSymbol<func::FuncOp>(StringRef("rowvec_mul_mat_abft_v2"));
     auto matcolFn =
-        module.lookupSymbol<func::FuncOp>(StringRef("mat_mul_colvec"));
+        module.lookupSymbol<func::FuncOp>(StringRef("mat_mul_colvec_abft_v2"));
     auto matrixAddFn = ensureFunctionWithBody("matrix_add", R"mlir(
 module {
   func.func @matrix_add(%lhs: tensor<?x?xf32>, %rhs: tensor<?x?xf32>) -> tensor<?x?xf32> {
@@ -3492,8 +3624,8 @@ module {
              name == "abft_analysis.abft_log_rowcol_debug" ||
              name == "sample_row_scales" || name == "sample_col_scales" ||
              name == "scale_matrix_rows" || name == "scale_matrix_cols" ||
-             name == "descale_matrix" || name == "rowvec_mul_mat" ||
-             name == "mat_mul_colvec" || name == "vector_add" ||
+             name == "descale_matrix" || name == "rowvec_mul_mat_abft_v2" ||
+             name == "mat_mul_colvec_abft_v2" || name == "vector_add" ||
              name == "matrix_add" || name == "matrix_sub" ||
              name == "zero_matrix_like";
     };
@@ -3628,13 +3760,13 @@ module {
 
         Value expectedOutRowChecksum = builder
                                            .create<func::CallOp>(
-                                               loc, StringRef("mat_mul_colvec"),
+                                               loc, StringRef("mat_mul_colvec_abft_v2"),
                                                TypeRange{matcolFn.getFunctionType().getResult(0)},
                                                ValueRange{lhsDyn, scaledRhsRowChecksum})
                                            .getResult(0);
         Value expectedOutColChecksum = builder
                                            .create<func::CallOp>(
-                                               loc, StringRef("rowvec_mul_mat"),
+                                               loc, StringRef("rowvec_mul_mat_abft_v2"),
                                                TypeRange{rowvecFn.getFunctionType().getResult(0)},
                                                ValueRange{scaledLhsColChecksum, rhsDyn})
                                            .getResult(0);
@@ -3819,13 +3951,13 @@ module {
                                  .getResult(0);
       Value expectedOutRowChecksum = builder
                                          .create<func::CallOp>(
-                                             loc, StringRef("mat_mul_colvec"),
+                                             loc, StringRef("mat_mul_colvec_abft_v2"),
                                              TypeRange{matcolFn.getFunctionType().getResult(0)},
                                              ValueRange{lhsDyn, scaledRhsRowChecksum})
                                          .getResult(0);
       Value expectedOutColChecksum = builder
                                          .create<func::CallOp>(
-                                             loc, StringRef("rowvec_mul_mat"),
+                                             loc, StringRef("rowvec_mul_mat_abft_v2"),
                                              TypeRange{rowvecFn.getFunctionType().getResult(0)},
                                              ValueRange{scaledLhsColChecksum, rhsDyn})
                                          .getResult(0);

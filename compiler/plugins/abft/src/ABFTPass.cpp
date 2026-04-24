@@ -20,6 +20,7 @@
 #include "mlir/Pass/Pass.h"
 // Command line option parsing for the standalone flag used by the pass.
 #include "llvm/Support/CommandLine.h"
+#include <algorithm>
 #include <regex>
 #include <string>
 
@@ -68,6 +69,16 @@ static llvm::cl::opt<std::string> abftInjectFaultPattern(
     "Fault injection pattern: single_point, trivial, checkered"),
   llvm::cl::init("single_point"));
 
+static llvm::cl::opt<int> abftInjectFaultRow(
+    "abft-inject-fault-row",
+    llvm::cl::desc("Target output row index for single_point fault injection"),
+    llvm::cl::init(0));
+
+static llvm::cl::opt<int> abftInjectFaultCol(
+    "abft-inject-fault-col",
+    llvm::cl::desc("Target output column index for single_point fault injection"),
+    llvm::cl::init(0));
+
 namespace {
 
 constexpr StringLiteral kAbftModeAttrName = "iree.abft.mode";
@@ -84,11 +95,26 @@ struct ABFTSpecializeBatchDimPass
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<tensor::TensorDialect>();
+    registry.insert<arith::ArithDialect, cf::ControlFlowDialect,
+                    func::FuncDialect, linalg::LinalgDialect,
+                    math::MathDialect, scf::SCFDialect,
+                    tensor::TensorDialect>();
   }
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
+    // This pass rewrites and reparses textual IR. Ensure all potentially used
+    // dialects are loaded up-front to avoid lazy dialect loading while the pass
+    // manager is in a multithread-capable context.
+    MLIRContext *ctx = module.getContext();
+    ctx->getOrLoadDialect<arith::ArithDialect>();
+    ctx->getOrLoadDialect<cf::ControlFlowDialect>();
+    ctx->getOrLoadDialect<func::FuncDialect>();
+    ctx->getOrLoadDialect<linalg::LinalgDialect>();
+    ctx->getOrLoadDialect<math::MathDialect>();
+    ctx->getOrLoadDialect<scf::SCFDialect>();
+    ctx->getOrLoadDialect<tensor::TensorDialect>();
+
     std::string irText;
     llvm::raw_string_ostream os(irText);
     module.print(os);
@@ -147,8 +173,7 @@ struct ABFTSpecializeBatchDimPass
           return std::string("\"tensor.empty\"() : () -> tensor<") + ty + ">";
         });
 
-    OwningOpRef<ModuleOp> reparsed =
-        parseSourceString<ModuleOp>(irText, module.getContext());
+    OwningOpRef<ModuleOp> reparsed = parseSourceString<ModuleOp>(irText, ctx);
     if (!reparsed) {
       module.emitError(
           "abft-specialize-batch-dim: failed to parse rewritten module text");
@@ -1144,7 +1169,7 @@ module {
       if (pattern == "single_point") {
         (void)ensureFunctionWithBody("apply_fault_i32_single_point", R"mlir(
 module {
-  func.func @apply_fault_i32_single_point(%mat: tensor<?x?xi32>, %delta: i32) -> tensor<?x?xi32> {
+  func.func @apply_fault_i32_single_point(%mat: tensor<?x?xi32>, %delta: i32, %row: index, %col: index) -> tensor<?x?xi32> {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %rows = tensor.dim %mat, %c0 : tensor<?x?xi32>
@@ -1159,8 +1184,8 @@ module {
       ^bb0(%a: i32, %acc: i32):
         %i = linalg.index 0 : index
         %j = linalg.index 1 : index
-        %hit_i = arith.cmpi eq, %i, %c0 : index
-        %hit_j = arith.cmpi eq, %j, %c0 : index
+        %hit_i = arith.cmpi eq, %i, %row : index
+        %hit_j = arith.cmpi eq, %j, %col : index
         %hit = arith.andi %hit_i, %hit_j : i1
         %res = arith.select %hit, %delta, %zero : i32
         %sum = arith.addi %a, %res : i32
@@ -1213,6 +1238,8 @@ module {
   func.func @apply_fault_i32_checkered(%mat: tensor<?x?xi32>, %delta: i32) -> tensor<?x?xi32> {
     %c0 = arith.constant 0 : index
     %c2 = arith.constant 2 : index
+    %c16_i32 = arith.constant 16 : i32
+    %delta16 = arith.muli %delta, %c16_i32 : i32
     %rows = tensor.dim %mat, %c0 : tensor<?x?xi32>
     %c1 = arith.constant 1 : index
     %cols = tensor.dim %mat, %c1 : tensor<?x?xi32>
@@ -1228,8 +1255,8 @@ module {
         %im = arith.remui %i, %c2 : index
         %is_even = arith.cmpi eq, %im, %c0 : index
         %zero_i32 = arith.constant 0 : i32
-        %minus_delta = arith.subi %zero_i32, %delta : i32
-        %fault = arith.select %is_even, %delta, %minus_delta : i32
+        %minus_delta16 = arith.subi %zero_i32, %delta16 : i32
+        %fault = arith.select %is_even, %delta16, %minus_delta16 : i32
         %sum = arith.addi %a, %fault : i32
         linalg.yield %sum : i32
     } -> tensor<?x?xi32>
@@ -1319,9 +1346,17 @@ module {
             if (injectSym) {
               auto deltaVal = bAfter.create<arith::ConstantIntOp>(
                 loc, abftInjectFaultDelta, /*width=*/32);
+              SmallVector<Value, 4> injectArgs{injArg, deltaVal.getResult()};
+              if (pattern == "single_point") {
+                auto faultRow = bAfter.create<arith::ConstantIndexOp>(
+                    loc, std::max<int64_t>(0, static_cast<int64_t>(abftInjectFaultRow.getValue())));
+                auto faultCol = bAfter.create<arith::ConstantIndexOp>(
+                    loc, std::max<int64_t>(0, static_cast<int64_t>(abftInjectFaultCol.getValue())));
+                injectArgs.push_back(faultRow.getResult());
+                injectArgs.push_back(faultCol.getResult());
+              }
               Value injected = bAfter
-                .create<func::CallOp>(loc, injectFn, TypeRange(injTypes),
-                                      ValueRange{injArg, deltaVal.getResult()})
+                .create<func::CallOp>(loc, injectFn, TypeRange(injTypes), ValueRange{injectArgs})
                 .getResult(0);
               if (injected.getType() != outRes.getType()) {
                 injected = bAfter.create<tensor::CastOp>(loc, outRes.getType(), injected).getResult();
@@ -1725,10 +1760,19 @@ module {
                   if (injectSym) {
                   auto deltaVal = bAfter.create<arith::ConstantIntOp>(
                     loc, abftInjectFaultDelta, /*width=*/32);
+                  SmallVector<Value, 4> injectArgs{injArg, deltaVal.getResult()};
+                  if (pattern == "single_point") {
+                    auto faultRow = bAfter.create<arith::ConstantIndexOp>(
+                        loc, std::max<int64_t>(0, static_cast<int64_t>(abftInjectFaultRow.getValue())));
+                    auto faultCol = bAfter.create<arith::ConstantIndexOp>(
+                        loc, std::max<int64_t>(0, static_cast<int64_t>(abftInjectFaultCol.getValue())));
+                    injectArgs.push_back(faultRow.getResult());
+                    injectArgs.push_back(faultCol.getResult());
+                  }
                   Value injected = bAfter
                              .create<func::CallOp>(
                                loc, injectFn, TypeRange(injTypes),
-                               ValueRange{injArg, deltaVal.getResult()})
+                               ValueRange{injectArgs})
                              .getResult(0);
                   if (injected.getType() != outI32.getType()) {
                     injected =
@@ -2027,6 +2071,10 @@ module {
            currentLayer == static_cast<int64_t>(abftInjectFaultLayer))) {
         StringRef pattern = abftInjectFaultPattern.getValue();
         Value c0 = bAfter.create<arith::ConstantIndexOp>(loc, 0);
+        Value cFaultRow = bAfter.create<arith::ConstantIndexOp>(
+            loc, std::max<int64_t>(0, static_cast<int64_t>(abftInjectFaultRow.getValue())));
+        Value cFaultCol = bAfter.create<arith::ConstantIndexOp>(
+            loc, std::max<int64_t>(0, static_cast<int64_t>(abftInjectFaultCol.getValue())));
         Value c1 = bAfter.create<arith::ConstantIndexOp>(loc, 1);
         Value c2 = bAfter.create<arith::ConstantIndexOp>(loc, 2);
         Value rows = bAfter.create<tensor::DimOp>(loc, compare2d, c0);
@@ -2072,9 +2120,9 @@ module {
                           nestedBuilder.getF32FloatAttr(0.0f));
                       if (pattern == "single_point") {
                         Value hitI = nestedBuilder.create<arith::CmpIOp>(
-                            nestedLoc, arith::CmpIPredicate::eq, i, c0);
+                            nestedLoc, arith::CmpIPredicate::eq, i, cFaultRow);
                         Value hitJ = nestedBuilder.create<arith::CmpIOp>(
-                            nestedLoc, arith::CmpIPredicate::eq, j, c0);
+                            nestedLoc, arith::CmpIPredicate::eq, j, cFaultCol);
                         Value hit = nestedBuilder.create<arith::AndIOp>(
                             nestedLoc, hitI, hitJ);
                         fault = nestedBuilder.create<arith::SelectOp>(
@@ -2101,10 +2149,15 @@ module {
                         Value im = nestedBuilder.create<arith::RemUIOp>(nestedLoc, i, c2);
                         Value even = nestedBuilder.create<arith::CmpIOp>(
                             nestedLoc, arith::CmpIPredicate::eq, im, c0);
+                        Value scale16 = nestedBuilder.create<arith::ConstantOp>(
+                            nestedLoc, nestedBuilder.getF32Type(),
+                            nestedBuilder.getF32FloatAttr(16.0f));
+                        Value delta16 = nestedBuilder.create<arith::MulFOp>(
+                            nestedLoc, deltaVal, scale16);
                         Value neg =
-                            nestedBuilder.create<arith::SubFOp>(nestedLoc, zero, deltaVal);
+                            nestedBuilder.create<arith::SubFOp>(nestedLoc, zero, delta16);
                         fault = nestedBuilder.create<arith::SelectOp>(
-                            nestedLoc, even, deltaVal, neg);
+                            nestedLoc, even, delta16, neg);
                       }
                       Value sum = nestedBuilder.create<arith::AddFOp>(
                           nestedLoc, args[0], fault);

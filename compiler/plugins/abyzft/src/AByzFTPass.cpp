@@ -6,6 +6,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -108,6 +109,23 @@ static llvm::cl::opt<std::string> abyzftInjectFaultPattern(
     "abyzft-inject-fault-pattern",
     llvm::cl::desc("Fault injection pattern: single_point, trivial, checkered"),
     llvm::cl::init("single_point"));
+
+static llvm::cl::opt<int> abyzftInjectFaultRow(
+    "abyzft-inject-fault-row",
+    llvm::cl::desc("Target output row index for single_point fault injection"),
+    llvm::cl::init(0));
+
+static llvm::cl::opt<int> abyzftInjectFaultCol(
+    "abyzft-inject-fault-col",
+    llvm::cl::desc("Target output column index for single_point fault injection"),
+    llvm::cl::init(0));
+
+static llvm::cl::opt<bool> abyzftEnableBatchSpecialization(
+    "abyzft-enable-batch-specialization",
+    llvm::cl::desc(
+        "Enable internal text-based leading-batch specialization "
+        "(can be unstable on dynamic-shape models)"),
+    llvm::cl::init(false));
 
 template <typename T>
 static SmallVector<T> parseCsvList(StringRef csv, std::function<FailureOr<T>(StringRef)> parser) {
@@ -265,6 +283,16 @@ static DenseElementsAttr buildSplatIntTensorAttr(RankedTensorType type,
 }
 
 static LogicalResult specializeLeadingBatchDimInModule(ModuleOp module) {
+  // This function reparses module text. Preload all dialects that may appear in
+  // model IR to avoid lazy dialect loading from a multi-threaded PM context.
+  MLIRContext *ctx = module.getContext();
+  ctx->getOrLoadDialect<func::FuncDialect>();
+  ctx->getOrLoadDialect<linalg::LinalgDialect>();
+  ctx->getOrLoadDialect<tensor::TensorDialect>();
+  ctx->getOrLoadDialect<arith::ArithDialect>();
+  ctx->getOrLoadDialect<math::MathDialect>();
+  ctx->getOrLoadDialect<scf::SCFDialect>();
+
   std::string irText;
   llvm::raw_string_ostream os(irText);
   module.print(os);
@@ -316,8 +344,7 @@ static LogicalResult specializeLeadingBatchDimInModule(ModuleOp module) {
         return std::string("\"tensor.empty\"() : () -> tensor<") + ty + ">";
       });
 
-  OwningOpRef<ModuleOp> reparsed =
-      parseSourceString<ModuleOp>(irText, module.getContext());
+  OwningOpRef<ModuleOp> reparsed = parseSourceString<ModuleOp>(irText, ctx);
   if (!reparsed) {
     module.emitError(
         "batch specialization failed to parse rewritten module text");
@@ -688,6 +715,10 @@ static Value applyAByzFTFault(OpBuilder &builder, Location loc, Value tensor,
   Value c0 = builder.create<arith::ConstantIndexOp>(loc, 0);
   Value c1 = builder.create<arith::ConstantIndexOp>(loc, 1);
   Value c2 = builder.create<arith::ConstantIndexOp>(loc, 2);
+  Value cFaultRow = builder.create<arith::ConstantIndexOp>(
+      loc, std::max<int64_t>(0, static_cast<int64_t>(abyzftInjectFaultRow.getValue())));
+  Value cFaultCol = builder.create<arith::ConstantIndexOp>(
+      loc, std::max<int64_t>(0, static_cast<int64_t>(abyzftInjectFaultCol.getValue())));
   SmallVector<Value, 2> dynSizes;
   if (ty.isDynamicDim(0)) {
     dynSizes.push_back(builder.create<tensor::DimOp>(loc, tensor, c0).getResult());
@@ -700,25 +731,32 @@ static Value applyAByzFTFault(OpBuilder &builder, Location loc, Value tensor,
 
   Value zeroVal;
   Value deltaVal;
+  Value checkeredDeltaVal;
   Value minusDeltaVal;
   if (isFloat) {
     auto fTy = llvm::cast<FloatType>(elementType);
     zeroVal = builder.create<arith::ConstantFloatOp>(loc, APFloat(0.0f), fTy).getResult();
     Value deltaI32 = builder.create<arith::ConstantIntOp>(loc, delta, 32).getResult();
     deltaVal = builder.create<arith::SIToFPOp>(loc, fTy, deltaI32).getResult();
-    minusDeltaVal = builder.create<arith::NegFOp>(loc, deltaVal).getResult();
+    Value scale16 = builder.create<arith::ConstantFloatOp>(loc, APFloat(16.0f), fTy).getResult();
+    checkeredDeltaVal = builder.create<arith::MulFOp>(loc, deltaVal, scale16).getResult();
+    minusDeltaVal = builder.create<arith::NegFOp>(loc, checkeredDeltaVal).getResult();
   } else {
     auto iTy = llvm::cast<IntegerType>(elementType);
     Value deltaI32 = builder.create<arith::ConstantIntOp>(loc, delta, 32).getResult();
+    Value c16I32 = builder.create<arith::ConstantIntOp>(loc, 16, 32).getResult();
+    Value delta16I32 = builder.create<arith::MulIOp>(loc, deltaI32, c16I32).getResult();
     Value zeroI32 = builder.create<arith::ConstantIntOp>(loc, 0, 32).getResult();
     if (iTy.getWidth() == 32) {
       zeroVal = zeroI32;
       deltaVal = deltaI32;
+      checkeredDeltaVal = delta16I32;
     } else {
       zeroVal = builder.create<arith::TruncIOp>(loc, iTy, zeroI32).getResult();
       deltaVal = builder.create<arith::TruncIOp>(loc, iTy, deltaI32).getResult();
+      checkeredDeltaVal = builder.create<arith::TruncIOp>(loc, iTy, delta16I32).getResult();
     }
-    minusDeltaVal = builder.create<arith::SubIOp>(loc, zeroVal, deltaVal).getResult();
+    minusDeltaVal = builder.create<arith::SubIOp>(loc, zeroVal, checkeredDeltaVal).getResult();
   }
 
   Value init = builder.create<linalg::FillOp>(loc, ValueRange{zeroVal}, ValueRange{empty}).getResult(0);
@@ -735,8 +773,8 @@ static Value applyAByzFTFault(OpBuilder &builder, Location loc, Value tensor,
             Value j = nb.create<linalg::IndexOp>(nloc, 1).getResult();
             Value fault = zeroVal;
             if (pattern == "single_point") {
-              Value hitI = nb.create<arith::CmpIOp>(nloc, arith::CmpIPredicate::eq, i, c0).getResult();
-              Value hitJ = nb.create<arith::CmpIOp>(nloc, arith::CmpIPredicate::eq, j, c0).getResult();
+              Value hitI = nb.create<arith::CmpIOp>(nloc, arith::CmpIPredicate::eq, i, cFaultRow).getResult();
+              Value hitJ = nb.create<arith::CmpIOp>(nloc, arith::CmpIPredicate::eq, j, cFaultCol).getResult();
               Value hit = nb.create<arith::AndIOp>(nloc, hitI, hitJ).getResult();
               fault = nb.create<arith::SelectOp>(nloc, hit, deltaVal, zeroVal).getResult();
             } else if (pattern == "trivial") {
@@ -751,7 +789,7 @@ static Value applyAByzFTFault(OpBuilder &builder, Location loc, Value tensor,
             } else {
               Value im = nb.create<arith::RemUIOp>(nloc, i, c2).getResult();
               Value isEven = nb.create<arith::CmpIOp>(nloc, arith::CmpIPredicate::eq, im, c0).getResult();
-              fault = nb.create<arith::SelectOp>(nloc, isEven, deltaVal, minusDeltaVal).getResult();
+              fault = nb.create<arith::SelectOp>(nloc, isEven, checkeredDeltaVal, minusDeltaVal).getResult();
             }
             Value out = isFloat ? nb.create<arith::AddFOp>(nloc, args[0], fault).getResult()
                                 : nb.create<arith::AddIOp>(nloc, args[0], fault).getResult();
@@ -917,12 +955,20 @@ struct AByzFTPass : public PassWrapper<AByzFTPass, OperationPass<ModuleOp>> {
   StringRef getDescription() const final {
     return "Insert ABFT checksum computation around linalg.matmul with scaled inputs and descaled outputs.";
   }
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<arith::ArithDialect, cf::ControlFlowDialect,
+                    func::FuncDialect, linalg::LinalgDialect,
+                    math::MathDialect, scf::SCFDialect,
+                    tensor::TensorDialect>();
+  }
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
-    if (failed(specializeLeadingBatchDimInModule(module))) {
-      signalPassFailure();
-      return;
+    if (abyzftEnableBatchSpecialization) {
+      if (failed(specializeLeadingBatchDimInModule(module))) {
+        signalPassFailure();
+        return;
+      }
     }
     (void)abyzftInjectFaultPattern;
     if (auto modeAttr = module->getAttrOfType<StringAttr>(kAbftModeAttrName)) {
@@ -944,6 +990,7 @@ struct AByzFTPass : public PassWrapper<AByzFTPass, OperationPass<ModuleOp>> {
     ctx->getOrLoadDialect<tensor::TensorDialect>();
     ctx->getOrLoadDialect<arith::ArithDialect>();
     ctx->getOrLoadDialect<math::MathDialect>();
+    ctx->getOrLoadDialect<scf::SCFDialect>();
 
     auto symbolExists = [&](StringRef name) {
       for (Operation &op : module.getBody()->getOperations()) {
@@ -3088,12 +3135,20 @@ struct FreivaldPass : public PassWrapper<FreivaldPass, OperationPass<ModuleOp>> 
   StringRef getDescription() const final {
     return "Insert ABFT checksum computation with weighted checksum generation without scaling the matmul operands.";
   }
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<arith::ArithDialect, cf::ControlFlowDialect,
+                    func::FuncDialect, linalg::LinalgDialect,
+                    math::MathDialect, scf::SCFDialect,
+                    tensor::TensorDialect>();
+  }
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
-    if (failed(specializeLeadingBatchDimInModule(module))) {
-      signalPassFailure();
-      return;
+    if (abyzftEnableBatchSpecialization) {
+      if (failed(specializeLeadingBatchDimInModule(module))) {
+        signalPassFailure();
+        return;
+      }
     }
     if (auto modeAttr = module->getAttrOfType<StringAttr>(kAbftModeAttrName)) {
       if (modeAttr.getValue() != kAbftModeFreivald) {
@@ -3114,6 +3169,7 @@ struct FreivaldPass : public PassWrapper<FreivaldPass, OperationPass<ModuleOp>> 
     ctx->getOrLoadDialect<tensor::TensorDialect>();
     ctx->getOrLoadDialect<arith::ArithDialect>();
     ctx->getOrLoadDialect<math::MathDialect>();
+    ctx->getOrLoadDialect<scf::SCFDialect>();
 
     auto symbolExists = [&](StringRef name) {
       for (Operation &op : module.getBody()->getOperations()) {

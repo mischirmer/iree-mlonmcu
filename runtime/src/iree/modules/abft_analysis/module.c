@@ -18,6 +18,16 @@
 #define IREE_ABFT_ANALYSIS_MODULE_VERSION_LATEST IREE_ABFT_ANALYSIS_MODULE_VERSION_0_0
 #define IREE_ABFT_ANALYSIS_DELTA_ASSERT_THRESHOLD 1.0e3f
 
+static int64_t iree_abft_analysis_global_failure_count = 0;
+
+IREE_API_EXPORT int64_t iree_abft_analysis_get_global_failure_count(void) {
+  return iree_abft_analysis_global_failure_count;
+}
+
+IREE_API_EXPORT void iree_abft_analysis_reset_global_failure_count(void) {
+  iree_abft_analysis_global_failure_count = 0;
+}
+
 // Define shims for (f) -> (), (ff) -> (), (fff) -> (), and () -> (I) signatures.
 IREE_VM_ABI_FIXED_STRUCT(ff, {
   float f0;
@@ -155,6 +165,12 @@ static void abft_log_scalar(iree_abft_analysis_module_state_t* state,
   fclose(f);
 }
 
+static uint32_t abft_f32_bits(float value) {
+  uint32_t bits = 0;
+  memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
 
 static float abft_read_buffer_view_scalar_f32(iree_hal_buffer_view_t* view) {
   if (!view) return 0.0f;
@@ -197,6 +213,7 @@ IREE_VM_ABI_EXPORT(iree_abft_analysis_module_abft_report_failure,
     }
     if (state->report_enabled) {
       state->failure_count++;
+      iree_abft_analysis_global_failure_count++;
     }
   }
   return iree_ok_status();
@@ -207,9 +224,15 @@ IREE_VM_ABI_EXPORT(iree_abft_analysis_module_abft_log_rowcol_delta,
                    iree_abft_analysis_module_state_t, fff, v) {
   const float row_delta = args->f1;
   const float col_delta = args->f2;
-  if (state->delta_assert_enabled &&
+  const int delta_violation =
       (fabsf(row_delta) > state->delta_assert_threshold ||
-       fabsf(col_delta) > state->delta_assert_threshold)) {
+       fabsf(col_delta) > state->delta_assert_threshold);
+  if (delta_violation) {
+    state->failure_count++;
+    iree_abft_analysis_global_failure_count++;
+  }
+  if (state->delta_assert_enabled &&
+      delta_violation) {
     return iree_make_status(
         IREE_STATUS_FAILED_PRECONDITION,
         "ABFT/Freivalds delta assertion failed: layer=%g rowMaxDelta=%g "
@@ -217,13 +240,17 @@ IREE_VM_ABI_EXPORT(iree_abft_analysis_module_abft_log_rowcol_delta,
         args->f0, row_delta, col_delta,
         state->delta_assert_threshold);
   }
-  fprintf(stdout, "abft_log_rowcol_delta layer=%.15g rowMaxDelta=%.15g colMaxDelta=%.15g\n",
-          args->f0, row_delta, col_delta);
+  fprintf(stdout,
+          "abft_log_rowcol_delta layerBits=0x%08x rowBits=0x%08x colBits=0x%08x rowInt=%ld colInt=%ld\n",
+          abft_f32_bits(args->f0), abft_f32_bits(row_delta), abft_f32_bits(col_delta),
+          (long)lrintf(row_delta), (long)lrintf(col_delta));
   if (!state->log_path) return iree_ok_status();
   FILE* f = fopen(state->log_path, "a");
   if (!f) return iree_ok_status();
-    fprintf(f, "layer=%.15g rowMaxDelta=%.15g colMaxDelta=%.15g\n", args->f0,
-            row_delta, col_delta);
+    fprintf(f,
+            "layerBits=0x%08x rowBits=0x%08x colBits=0x%08x rowInt=%ld colInt=%ld\n",
+            abft_f32_bits(args->f0), abft_f32_bits(row_delta), abft_f32_bits(col_delta),
+            (long)lrintf(row_delta), (long)lrintf(col_delta));
   fclose(f);
   return iree_ok_status();
 }
@@ -233,9 +260,15 @@ IREE_VM_ABI_EXPORT(iree_abft_analysis_module_abft_log_rowcol_metrics,
                    iree_abft_analysis_module_state_t, fffff, v) {
   const float row_delta = args->f1;
   const float col_delta = args->f2;
-  if (state->delta_assert_enabled &&
+  const int delta_violation =
       (fabsf(row_delta) > state->delta_assert_threshold ||
-       fabsf(col_delta) > state->delta_assert_threshold)) {
+       fabsf(col_delta) > state->delta_assert_threshold);
+  if (delta_violation) {
+    state->failure_count++;
+    iree_abft_analysis_global_failure_count++;
+  }
+  if (state->delta_assert_enabled &&
+      delta_violation) {
     return iree_make_status(
         IREE_STATUS_FAILED_PRECONDITION,
         "ABFT/Freivalds delta assertion failed: layer=%g rowMaxDelta=%g "
@@ -244,15 +277,19 @@ IREE_VM_ABI_EXPORT(iree_abft_analysis_module_abft_log_rowcol_metrics,
         state->delta_assert_threshold);
   }
   fprintf(stdout,
-          "abft_log_rowcol_metrics layer=%.15g rowMaxDelta=%.15g colMaxDelta=%.15g rowMaxRel=%.15g colMaxRel=%.15g\n",
-          args->f0, row_delta, col_delta, args->f3, args->f4);
+          "abft_log_rowcol_metrics layerBits=0x%08x rowBits=0x%08x colBits=0x%08x rowRelBits=0x%08x colRelBits=0x%08x rowInt=%ld colInt=%ld\n",
+          abft_f32_bits(args->f0), abft_f32_bits(row_delta), abft_f32_bits(col_delta),
+          abft_f32_bits(args->f3), abft_f32_bits(args->f4),
+          (long)lrintf(row_delta), (long)lrintf(col_delta));
   if (!state->log_path) return iree_ok_status();
   FILE* f = fopen(state->log_path, "a");
   if (!f) return iree_ok_status();
     fprintf(
       f,
-      "layer=%.15g rowMaxDelta=%.15g colMaxDelta=%.15g rowMaxRel=%.15g colMaxRel=%.15g\n",
-      args->f0, row_delta, col_delta, args->f3, args->f4);
+      "layerBits=0x%08x rowBits=0x%08x colBits=0x%08x rowRelBits=0x%08x colRelBits=0x%08x rowInt=%ld colInt=%ld\n",
+      abft_f32_bits(args->f0), abft_f32_bits(row_delta), abft_f32_bits(col_delta),
+      abft_f32_bits(args->f3), abft_f32_bits(args->f4),
+      (long)lrintf(row_delta), (long)lrintf(col_delta));
   fclose(f);
   return iree_ok_status();
 }
@@ -260,14 +297,20 @@ IREE_VM_ABI_EXPORT(iree_abft_analysis_module_abft_log_rowcol_metrics,
 IREE_VM_ABI_EXPORT(iree_abft_analysis_module_abft_log_rowcol_debug,
                    iree_abft_analysis_module_state_t, fffff, v) {
   fprintf(stdout,
-          "abft_log_rowcol_debug layer=%.15g rowExpMax=%.15g rowCalcMax=%.15g colExpMax=%.15g colCalcMax=%.15g\n",
-          args->f0, args->f1, args->f2, args->f3, args->f4);
+          "abft_log_rowcol_debug layerBits=0x%08x rowExpBits=0x%08x rowCalcBits=0x%08x colExpBits=0x%08x colCalcBits=0x%08x rowExpInt=%ld rowCalcInt=%ld colExpInt=%ld colCalcInt=%ld\n",
+          abft_f32_bits(args->f0), abft_f32_bits(args->f1), abft_f32_bits(args->f2),
+          abft_f32_bits(args->f3), abft_f32_bits(args->f4),
+          (long)lrintf(args->f1), (long)lrintf(args->f2),
+          (long)lrintf(args->f3), (long)lrintf(args->f4));
   if (!state->log_path) return iree_ok_status();
   FILE* f = fopen(state->log_path, "a");
   if (!f) return iree_ok_status();
     fprintf(f,
-      "layer=%.15g rowExpMax=%.15g rowCalcMax=%.15g colExpMax=%.15g colCalcMax=%.15g\n",
-      args->f0, args->f1, args->f2, args->f3, args->f4);
+      "layerBits=0x%08x rowExpBits=0x%08x rowCalcBits=0x%08x colExpBits=0x%08x colCalcBits=0x%08x rowExpInt=%ld rowCalcInt=%ld colExpInt=%ld colCalcInt=%ld\n",
+      abft_f32_bits(args->f0), abft_f32_bits(args->f1), abft_f32_bits(args->f2),
+      abft_f32_bits(args->f3), abft_f32_bits(args->f4),
+      (long)lrintf(args->f1), (long)lrintf(args->f2),
+      (long)lrintf(args->f3), (long)lrintf(args->f4));
   fclose(f);
   return iree_ok_status();
 }
